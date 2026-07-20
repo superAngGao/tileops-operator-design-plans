@@ -7,7 +7,7 @@ This repository collects discussion-stage design plans for TileOps operator fami
 | Plan | Scope | Status |
 | --- | --- | --- |
 | [Cross-Layer 算子族发布计划](plans/cross-layer-ops-release-plan-cn.md) | Cross-layer operator taxonomy, MHC manifest alignment, Block AttnRes path, and adjacent depth/cache mechanisms | Discussion draft |
-| [Quantized Inference 算子补齐计划](plans/quantized-inference-release-plan-cn.md) | Quantized inference gaps for modern open-source LLM serving, including FP8, INT4, MoE experts, and KV cache quantization | Discussion draft |
+| [推理量化功能补齐计划](plans/quantized-inference-release-plan-cn.md) | Quantization gaps across existing TileOps families, including FP8, INT4, MoE experts, GEMM, and KV cache paths | Discussion draft |
 | [GQA / FP8 Attention planning bundle](plans/gqa/) | GQA prefill/decode plans, FP8 GQA Hopper notes, issue drafts, assets, and contribution reports migrated from `tileops-gqa-plan` | Planning archive |
 
 ## How To Read
