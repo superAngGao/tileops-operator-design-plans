@@ -56,7 +56,7 @@ quantize / pack / scale metadata
 ### 3.2 按现有 Family 拆分的缺口
 
 | Family / 方向 | 已有能力 | 主要缺口 | 对应模型需求 |
-| --- | --- | --- |
+| --- | --- | --- | --- |
 | `attention` | FP8 GQA prefill tensor-core path；FP8 LightingIndexer | FP8 decode with quantized KV cache、FP8 KV cache quantize/dequant、paged KV scale metadata、quantized MLA/KDA/linear-attention variants | vLLM FP8 KV cache、Llama/Qwen FP8 attention、DeepSeek MLA / Kimi KDA 后续量化 |
 | `moe` | routing / permute / unpermute / grouped expert abstraction；prepare/finalize quant hook | quantized routed experts、quantized shared expert、activation quantization after dispatch、per-expert scale metadata、W4A16 / FP8 expert GEMM | Qwen MoE、DeepSeek-V3、Kimi K2/K3、Llama 4 Maverick |
 | `gemm` / `grouped_gemm` | dense GEMM / grouped GEMM kernels exist, plus MoE grouped compute path | FP8 W8A8 Linear、weight-only W4A16 / W8A16 Linear、AWQ/GPTQ/Marlin-like packed layouts、scale/zero metadata；manifest family 也需要补齐 | Qwen AWQ/GPTQ/FP8、Llama INT4 / FP8、Kimi INT4 |
