@@ -47,7 +47,7 @@ quantize / pack / scale metadata
 
 | 能力 | 位置 | 状态判断 |
 | --- | --- | --- |
-| FP8 activation quantization | `tileops/ops/fp8_quant.py`, `tileops/kernels/fp8_quant.py` | 有专用 op，但 shape / scale contract 仍偏局部 |
+| FP8 activation / KV-shaped quantization | `tileops/ops/fp8_quant.py`, `tileops/kernels/fp8_quant.py` | 有专用 op，输入形状是 `(batch, seq_len_kv, kv_group, index_dim)`，能产出 fp8 tensor 和 per-token/per-group scale；但还没有成为 attention KV cache 的完整 manifest contract |
 | FP8 LightingIndexer | `tileops/ops/fp8_lighting_indexer.py` | attention indexing 相关局部能力 |
 | FP8 GQA prefill tensor-core path | `GroupedQueryAttentionPrefillFP8TensorCoreFwdOp` in `tileops/manifest/attention.yaml` | 已进入 attention manifest，是目前最接近 serving hot path 的 FP8 kernel |
 | MoE prepare/finalize abstraction | `tileops/ops/moe/abc.py` | 已预留 quantization / EP dispatch 位置，但默认实现仍是 pass-through |
@@ -75,7 +75,7 @@ current anchor -> missing contract -> first PR boundary -> not in scope
 | `elementwise` / `reduction` / layout helpers | `FP8QuantOp`、fp8 elementwise benchmark | amax / scale update / dequant / pack metadata 不统一 | 先补共享 helper contract |
 | `gemm` / `grouped_gemm` | `tileops/ops/gemm.py`、`tileops/ops/grouped_gemm.py`、benchmarks | 缺 manifest；缺 FP8 W8A8 / W4A16 layout contract | 先补 GEMM manifest，再挂量化 variant |
 | `moe` | routing、permute、unpermute、grouped expert abstraction | 缺 quantized expert weights、activation quant、per-expert scale | 先做 compositional quantized expert path |
-| `attention` | FP8 GQA prefill tensor-core path；FP8 LightingIndexer；bf16/fp16 decode / paged decode | 缺 FP8 KV cache quant/dequant、FP8 decode、paged scale metadata | 先做 dense FP8 KV decode contract，再进 paged |
+| `attention` | FP8 GQA prefill tensor-core path；FP8 LightingIndexer；KV-shaped `FP8QuantOp`；bf16/fp16 decode / paged decode | 缺 FP8 KV cache dequant、FP8 decode consumer、paged scale metadata、attention-family ownership | 先把现有 FP8 quant 接到 dense KV cache decode contract，再进 paged |
 | `normalization` / activation | RMSNorm / LayerNorm / fused add norm | 缺 norm/activation + quantize epilogue 的稳定边界 | 等 GEMM / MoE 明确消费后再抽 |
 | `linear_attn` / `sequence_modeling` | GDN/KDA/GLA/SSD-style kernels in progress | 缺 quantized state/KV/cache representation | 先记录模型 contract，暂不抢第一批实现 |
 
@@ -205,11 +205,35 @@ shared expert + routed expert
 
 Attention 里已经有 FP8 GQA prefill tensor-core path，也有普通 GQA/MHA decode 和 paged decode。缺口不在“有没有 attention”，而在 decode 阶段能否稳定消费 quantized KV cache。
 
-第一批要把 KV cache 的 scale contract 讲清楚：
+这里需要修正一个容易误解的点：TileOps 已经有 KV-shaped 的 `FP8QuantOp`。它的输入是：
+
+```text
+input_tensor: [batch, seq_len_kv, kv_group, index_dim]
+```
+
+输出是：
+
+```text
+scale_tensor:  [batch, seq_len_kv, kv_group]
+output_tensor: [batch, seq_len_kv, kv_group, index_dim], dtype=float8_e4m3fn
+```
+
+所以 attention family 的缺口不是“完全没有 KV quantization kernel”，而是这个 kernel 还没有被提升成完整 KV cache serving contract：
+
+```text
+1. 缺 attention-family manifest entry / ownership；
+2. 缺 FP8 KV cache dequant helper 或 fused dequant-consumer；
+3. 缺 GQA/MHA decode 直接消费 FP8 K/V cache + scale metadata；
+4. 缺 paged KV cache 下 scale metadata 与 block_table 的形状约定；
+5. 缺 decode output correctness against bf16/fp16 KV reference。
+```
+
+第一批要把 KV cache 的 scale contract 和 decode consumer 讲清楚：
 
 ```text
 FP8KVCacheQuantizeFwdOp:
   K/V -> K_fp8, V_fp8, K_scale, V_scale
+  may be a manifest-level wrapper or extension around the existing FP8QuantOp
 
 GQADecodeWithFP8KVCacheFwdOp:
   Q + FP8 K/V cache + scale metadata -> O
@@ -296,7 +320,7 @@ per-page or per-cache-block scale, if paged KV uses it
 | `FP8LinearW8A8FwdOp`, `WeightOnlyLinearW4A16FwdOp` | `gemm` | 线性层和 GEMM 语义，不单独建 quantized family |
 | `QuantizedGroupedGemmFwdOp` | `grouped_gemm` | 可被 MoE 复用的低层 grouped GEMM 语义 |
 | `QuantizedMoeExpertsFwdOp` | `moe` | MoE expert compute 的 dtype/layout variant；可调用 grouped GEMM，但 op 语义属于 MoE |
-| `FP8KVCacheQuantizeFwdOp`, `GQADecodeWithFP8KVCacheFwdOp` | `attention` | KV cache 与 attention decode 语义 |
+| `FP8KVCacheQuantizeFwdOp`, `GQADecodeWithFP8KVCacheFwdOp` | `attention` | `FP8KVCacheQuantizeFwdOp` 可以复用 / 包装现有 KV-shaped `FP8QuantOp`；decode op 负责消费 FP8 K/V cache + scale metadata |
 | Quantized MLA / KDA / linear attention | owning attention / linear-attention family | 等模型 contract 稳定后按原算子 family 扩展 |
 
 ### 4.4 不进入范围
@@ -321,7 +345,7 @@ per-page or per-cache-block scale, if paged KV uses it
 | P0 | `gemm` / `grouped_gemm` manifest | 先补 `GemmFwdOp` / `GroupedGemmFwdOp` manifest，再挂量化 variant | 没有 manifest source of truth，量化 Linear / MoE expert PR 会失去归属 |
 | P1 | `gemm` | FP8 W8A8 Linear、W4A16 weight-only Linear | 这是 Qwen/Llama/Kimi/DeepSeek 量化推理最直接的 GEMM 热路径 |
 | P1 | `moe` | quantized routed experts / shared expert contract | MoE 是 Qwen3、DeepSeek-V3、Kimi K2/K3、Llama 4 Maverick 的共同热点 |
-| P2 | `attention` | FP8 KV cache quantize/dequantize 和 GQA decode | 长上下文 decode 的内存收益很明确，但 paged cache contract 需要和 serving engine 更仔细对齐 |
+| P2 | `attention` | 把已有 FP8 quant 接入 KV cache dequant / GQA decode / paged scale metadata | 长上下文 decode 的内存收益很明确，但 paged cache contract 需要和 serving engine 更仔细对齐 |
 | P2 | `linear_attn` / `sequence_modeling` | quantized MLA/KDA/linear-attention state path | 模型需求明确，但 checkpoint / runtime contract 还需要逐个确认 |
 
 ### 5.1 `elementwise` / `reduction` / layout helpers：Scale-Aware Quantize / Dequantize
@@ -430,7 +454,7 @@ fused target:
   fuse dequant + grouped GEMM + activation + topk weighted combine where it is profitable
 ```
 
-### 5.4 `attention`：FP8 KV Cache Quantization and Decode Attention
+### 5.4 `attention`：FP8 KV Cache and Decode Attention
 
 长上下文 decode 的核心压力来自 KV cache。vLLM 已经把 FP8 KV cache 作为 serving 功能，支持 per-tensor 和 per-head scale。
 
@@ -442,6 +466,8 @@ FP8KVCacheQuantizeFwdOp(
     v:      Tensor[B, S, H_kv, D],
     mode:   enum("per_tensor", "per_head"),
 ) -> (k_fp8, v_fp8, k_scale, v_scale)
+
+# This can reuse or wrap the existing KV-shaped FP8QuantOp.
 
 GQADecodeWithFP8KVCacheFwdOp(
     q:          Tensor[B, H, D],
