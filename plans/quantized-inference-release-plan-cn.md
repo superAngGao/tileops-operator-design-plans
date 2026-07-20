@@ -39,6 +39,47 @@ quantize / pack / scale metadata
 
 这张表只用于建立需求边界。具体模型版本、checkpoint 格式、engine 后端和 quantization metadata 需要在每个 tracking issue 中单独确认。
 
+### 2.1 GQA / KV Cache 需求应按模型和后端来拆
+
+GQA 的量化需求不能只写成“支持 FP8 KV cache”。对不同模型和后端来说，真正的 kernel 边界不同：
+
+| 模型 / 后端 | Attention / cache 形态 | KV cache 量化需求 | 计算形态判断 | 对 TileOps 的第一批含义 |
+| --- | --- | --- | --- | --- |
+| Qwen3 / Qwen3.5 GQA / MoE 系列 | 标准 GQA + 长上下文；vLLM 已用 Qwen3 / Qwen3.5 做 FP8 KV-cache + FP8 attention 验证 | FP8 KV cache 是核心需求；需要 per-tensor 起步，并保留 per-head / calibrated scale 扩展 | 目标不是先把 K/V 解回完整 bf16 cache，而是在 attention kernel 中在线应用 scale；Hopper / Blackwell 后端可走 FA3 / FlashInfer 风格的 FP8 attention 路径 | 优先做 `GQADecodeWithFP8KVCacheFwdOp` 的 dense contract，再扩展 paged scale metadata |
+| Llama 3.x / Llama 4 GQA 路径 | 标准 GQA，head_dim 通常更贴近主流 FA3 / FlashInfer 路径 | FP8 KV cache 用于降低 decode bandwidth / cache footprint | 长上下文 decode 主要是 bandwidth-sensitive；短上下文可能被固定 overhead 抵消 | 作为 baseline workload：dense non-paged、paged、per-tensor/per-head scale 都应覆盖 |
+| vLLM / SGLang serving path | 引擎级 KV cache dtype / page table / calibration policy | 需要对齐 serving engine 的 scale granularity、paged metadata 和 skip-layer policy | 旧的 storage-only FP8 cache 会在线 dequant；新的 FP8 attention 路径把 scale 应用融合到 attention consumer 中 | TileOps op 不管理 allocator，只暴露 quantized KV read / scale-aware attention compute |
+| DeepSeek-V3 / V4 MLA 路径 | MLA / latent cache，不是标准 GQA K/V cache | 需要 quantized latent/cache/state contract，而不是直接复用 GQA FP8 KV cache contract | FP8 mixed precision 与 MLA cache 压缩是相关但不同的问题 | 放到 MLA / attention owning family 的后续 tracking issue，不塞进第一批 GQA contract |
+| Kimi KDA / FlashMLA / long-context 路径 | KDA / FlashMLA / prefill cache，和标准 GQA cache 不同 | 需要 KDA state / prefill-cache 的量化设计；非标准 backend 可能更依赖 calibration | vLLM 的经验显示非标准 attention backend 上 uncalibrated FP8 KV cache 可能有系统性精度下滑 | 作为 `linear_attn` / `sequence_modeling` 或 MLA-style cache quantization 的后续目标 |
+
+因此，GQA 这一条线第一批不是“恢复历史上的 paged prefill FP8 KV cache fused op”，而是把现有能力重新组织成更干净的 contract：
+
+```text
+1. KV cache write:
+   K/V -> K_fp8/V_fp8 + k_scale/v_scale
+
+2. Dense GQA decode cache read:
+   q(fp16/bf16) + K/V fp8 cache + scale -> o
+
+3. Paged GQA decode cache read:
+   q + fp8 pages + scale metadata + block_table + cache_seqlens -> o
+```
+
+计算上有三种层级，需要在 tracking issue 中明确：
+
+```text
+storage-only fallback:
+  读 fp8 K/V -> 在线 dequant 到 fp16/bf16 中间值 -> 普通 attention math
+  优点是 contract 简单；缺点是 latency gain 主要来自 cache footprint / bandwidth，不一定来自 Tensor Core compute。
+
+fused scale-aware attention:
+  读 fp8 K/V + scale -> 在 QK / PV 路径中直接应用 scale
+  这是 decode hot path 更应该追求的形态。
+
+full FP8 Q/K/V Tensor Core prefill:
+  q/k/v 全部 fp8，QK / PV 更接近 FP8 Tensor Core 路径
+  适合 prefill / large tile compute；它不是 KV cache decode contract 的替代品。
+```
+
 ## 3. TileOps 当前能力与按 Family 拆分的缺口
 
 ### 3.1 已有能力
@@ -75,7 +116,7 @@ current anchor -> missing contract -> first PR boundary -> not in scope
 | `elementwise` / `reduction` / layout helpers | `FP8QuantOp`、fp8 elementwise benchmark | amax / scale update / dequant / pack metadata 不统一 | 先补共享 helper contract |
 | `gemm` / `grouped_gemm` | `tileops/ops/gemm.py`、`tileops/ops/grouped_gemm.py`、benchmarks | 缺 manifest；缺 FP8 W8A8 / W4A16 layout contract | 先补 GEMM manifest，再挂量化 variant |
 | `moe` | routing、permute、unpermute、grouped expert abstraction | 缺 quantized expert weights、activation quant、per-expert scale | 先做 compositional quantized expert path |
-| `attention` | FP8 GQA compute path；FP8 LightingIndexer；KV-shaped `FP8QuantOp`；bf16/fp16 decode / paged decode | 底层已有 fp8 K/V + scale 读取能力；缺 decode/cache-facing manifest contract、paged scale metadata、reference / benchmark coverage | 先把现有 FP8 quant 和 FP8 GQA compute 收敛成 dense KV cache decode contract，再进 paged |
+| `attention` | FP8 GQA compute path；FP8 LightingIndexer；KV-shaped `FP8QuantOp`；bf16/fp16 decode / paged decode | 底层已有 fp8 K/V + scale 读取能力；缺 decode/cache-facing manifest contract、paged scale metadata、reference / benchmark coverage | 按模型需求先做 dense FP8 KV cache read contract，再进 paged；storage-only dequant 只作为 fallback / reference |
 | `normalization` / activation | RMSNorm / LayerNorm / fused add norm | 缺 norm/activation + quantize epilogue 的稳定边界 | 等 GEMM / MoE 明确消费后再抽 |
 | `linear_attn` / `sequence_modeling` | GDN/KDA/GLA/SSD-style kernels in progress | 缺 quantized state/KV/cache representation | 先记录模型 contract，暂不抢第一批实现 |
 
@@ -205,6 +246,8 @@ shared expert + routed expert
 
 Attention 里已经有 FP8 GQA compute path，也有普通 GQA/MHA decode 和 paged decode。缺口不在“GQA 能不能读 fp8 K/V”这个底层 kernel 能力，而在 decode / KV cache 语义是否已经形成稳定的公开 op contract。
 
+从模型需求看，这一节只把标准 GQA / MQA 的 KV cache 作为第一批目标。DeepSeek MLA、Kimi KDA / FlashMLA 这类非标准 cache/state 路径需要单独设计，不能强行塞进 GQA FP8 KV cache contract。
+
 这里需要修正两个容易误解的点。
 
 第一，TileOps 已经有 KV-shaped 的 `FP8QuantOp`。它的输入是：
@@ -228,7 +271,7 @@ output_tensor: [batch, seq_len_kv, kv_group, index_dim], dtype=float8_e4m3fn
 3. 缺 dense decode / q_len=1 / cache-read 场景的 reference、shape rules 和 benchmark；
 4. 缺 paged KV cache 下 scale metadata 与 block_table 的形状约定；
 5. 缺 decode output correctness against bf16/fp16 KV reference；
-6. dequant helper 只在 reference/debug 或非 fused fallback 需要时独立成 op，热路径优先走 fused scale-aware consumer。
+6. storage-only dequant helper 只在 reference/debug 或非 fused fallback 需要时独立成 op，热路径优先走 fused scale-aware consumer。
 ```
 
 第一批要把 KV cache 的 scale contract 和 decode/cache-facing wrapper 讲清楚：
@@ -242,6 +285,16 @@ GQADecodeWithFP8KVCacheFwdOp:
   Q + FP8 K/V cache + scale metadata -> O
   在 shape contract 覆盖 decode/cache-read 场景时复用现有 FP8 GQA compute
 ```
+
+这里的计算目标不是先把整个 KV cache 解量化回 bf16/fp16 再调用普通 decode。第一版可以保留 storage-only fallback 作为 reference，但服务热路径应该是：
+
+```text
+Q(fp16/bf16) + K/V(fp8) + scale
+  -> scale-aware QK / PV
+  -> O(fp16/bf16)
+```
+
+完整 FP8 Q/K/V Tensor Core prefill 是另一条已有能力，适合 large prefill tile；它不能替代 decode 侧的 FP8 KV cache contract。
 
 落地顺序应该是：
 
@@ -659,7 +712,9 @@ end-to-end fused path
 - Meta Llama 4 release blog: https://ai.meta.com/blog/llama-4-multimodal-intelligence/
 - DeepSeek-V3 Technical Report, FP8 training and fine-grained quantization: https://arxiv.org/html/2412.19437v1
 - MoonshotAI Kimi K2 repository: https://github.com/moonshotai/kimi-k2
+- Kimi K3 technical blog, KDA / QAT / prefill-cache context: https://www.kimi.com/blog/kimi-k3
 - Kimi K2 Thinking model card, native INT4 quantization: https://huggingface.co/moonshotai/Kimi-K2-Thinking
 - vLLM quantization documentation: https://docs.vllm.ai/en/latest/features/quantization/
 - vLLM quantized KV cache documentation: https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache/
+- vLLM FP8 KV-cache and attention quantization blog: https://vllm.ai/blog/2026-04-22-fp8-kvcache
 - AWQ paper: https://arxiv.org/abs/2306.00978
