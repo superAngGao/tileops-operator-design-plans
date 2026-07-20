@@ -1,0 +1,15 @@
+module,changed_lines,file_entries
+tileops,17221,194
+benchmarks,6247,209
+tests,4842,93
+top,1865,18
+.github,1811,29
+.claude,1399,10
+scripts,1229,14
+docs,180,2
+workloads,127,6
+.foundry,43,3
+pyproject.toml,16,5
+Makefile,9,1
+README.md,2,1
+CLAUDE.md,1,1

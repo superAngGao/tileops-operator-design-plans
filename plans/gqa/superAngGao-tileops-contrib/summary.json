@@ -1,0 +1,74 @@
+{
+  "repo": "tile-ai/TileOPs",
+  "ref": "upstream/main",
+  "latest_commit_date": "2026-05-05",
+  "first_main_commit_date": "2026-01-14",
+  "main_commits": 76,
+  "total_main_commits": 535,
+  "contribution_share": 14.205607476635516,
+  "author_rank": 2,
+  "all_prs": 91,
+  "merged_prs": 76,
+  "open_prs": 2,
+  "closed_unmerged_prs": 13,
+  "draft_prs": 7,
+  "pr_additions": 35750,
+  "pr_deletions": 9193,
+  "pr_changed_files": 663,
+  "git_additions": 28226,
+  "git_deletions": 6766,
+  "git_changed_file_entries": 586,
+  "top_commit_month": {
+    "month": "2026-03",
+    "commits": 49
+  },
+  "top_modules": [
+    {
+      "module": "tileops",
+      "changed_lines": 17221,
+      "file_entries": 194
+    },
+    {
+      "module": "benchmarks",
+      "changed_lines": 6247,
+      "file_entries": 209
+    },
+    {
+      "module": "tests",
+      "changed_lines": 4842,
+      "file_entries": 93
+    },
+    {
+      "module": "top",
+      "changed_lines": 1865,
+      "file_entries": 18
+    },
+    {
+      "module": ".github",
+      "changed_lines": 1811,
+      "file_entries": 29
+    }
+  ],
+  "top_categories": [
+    {
+      "category": "Fix",
+      "commits": 18
+    },
+    {
+      "category": "CI",
+      "commits": 14
+    },
+    {
+      "category": "Feat",
+      "commits": 12
+    },
+    {
+      "category": "Refactor",
+      "commits": 7
+    },
+    {
+      "category": "BugFix",
+      "commits": 7
+    }
+  ]
+}

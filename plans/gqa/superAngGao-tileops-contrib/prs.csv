@@ -1,0 +1,92 @@
+number,state,mergedAt,createdAt,title,additions,deletions,changedFiles,url
+1172,MERGED,2026-05-04T10:19:06Z,2026-05-04T03:13:06Z,[Feat][Ops] Add packed varlen GQA prefill,914,0,9,https://github.com/tile-ai/TileOPs/pull/1172
+1134,MERGED,2026-05-01T07:52:23Z,2026-05-01T06:57:24Z,[Doc] Update new operator subtask issue template,22,9,1,https://github.com/tile-ai/TileOPs/pull/1134
+1125,MERGED,2026-05-01T11:00:10Z,2026-04-30T10:18:13Z,[Feat][Ops] Add GQA prefill baseline ops,1439,3,11,https://github.com/tile-ai/TileOPs/pull/1125
+1117,OPEN,,2026-04-29T06:56:22Z,[Fix][Reduction] Fix bugs in logical and norm reductions,571,139,11,https://github.com/tile-ai/TileOPs/pull/1117
+1113,MERGED,2026-04-29T04:07:16Z,2026-04-29T03:53:59Z,[Bench] Fix nightly benchmark interface regressions,6,2,2,https://github.com/tile-ai/TileOPs/pull/1113
+1069,MERGED,2026-04-27T05:57:19Z,2026-04-27T05:34:03Z,[Bench] Skip known TileLang 0.1.9 benchmark failures,100,0,1,https://github.com/tile-ai/TileOPs/pull/1069
+1058,CLOSED,,2026-04-26T07:51:10Z,[CI] Fall back when data7 cache root is unavailable,45,1,2,https://github.com/tile-ai/TileOPs/pull/1058
+1053,MERGED,2026-04-26T03:20:02Z,2026-04-26T02:42:37Z,[CI] Move GPU CI caches to data7 shared cache,38,32,5,https://github.com/tile-ai/TileOPs/pull/1053
+1043,MERGED,2026-04-26T00:54:48Z,2026-04-24T09:38:17Z,[CI] Add temporary TileLang 0.1.9 skips,216,41,20,https://github.com/tile-ai/TileOPs/pull/1043
+1010,CLOSED,,2026-04-20T12:17:47Z,[Test][CI] Add smoke workflow for containerized nightly runner,62,0,2,https://github.com/tile-ai/TileOPs/pull/1010
+1004,CLOSED,,2026-04-20T09:24:52Z,[Refactor][CI] Migrate nightly from step-level docker run to native container jobs,244,228,2,https://github.com/tile-ai/TileOPs/pull/1004
+1002,MERGED,2026-04-27T09:15:18Z,2026-04-20T06:18:38Z,[Feat][Attention] Add H200-only WS dispatch to GroupedQueryAttentionFwdOp,985,5,9,https://github.com/tile-ai/TileOPs/pull/1002
+1001,MERGED,2026-04-20T11:25:29Z,2026-04-19T08:48:50Z,[Test][CI] Temporarily skip known failures under TileLang 5f70374c,161,8,14,https://github.com/tile-ai/TileOPs/pull/1001
+871,OPEN,,2026-04-09T06:20:06Z,[Feat][FlashAttn] Implement WS GQA forward kernel and a higher-performance persistent variant for SM90,1303,4,3,https://github.com/tile-ai/TileOPs/pull/871
+859,MERGED,2026-04-09T03:13:26Z,2026-04-08T09:17:17Z,[Refactor][MHC] Rename mhc family classes to MHC* per naming convention,61,63,13,https://github.com/tile-ai/TileOPs/pull/859
+857,MERGED,2026-04-09T03:12:23Z,2026-04-08T08:59:04Z,[Refactor][FP8] Rename Fp8* class names to FP8* per naming convention,56,56,13,https://github.com/tile-ai/TileOPs/pull/857
+854,CLOSED,,2026-04-08T08:11:28Z,[Doc][Naming] Add docs/naming-convention.md establishing class naming rules,127,0,2,https://github.com/tile-ai/TileOPs/pull/854
+820,MERGED,2026-04-07T08:07:30Z,2026-04-07T07:15:54Z,[Fix][Benchmark] Record kernel config for all Op patterns in benchmark report,159,1,2,https://github.com/tile-ai/TileOPs/pull/820
+817,MERGED,2026-04-07T07:38:04Z,2026-04-07T07:00:01Z,[Fix][Benchmark] Restore failing softmax and FA3 paged decode bench cases in nightly,67,8,5,https://github.com/tile-ai/TileOPs/pull/817
+774,CLOSED,,2026-04-03T06:12:17Z,"[Fix][CI] Benchmark fixes, FA3 paged decode, add mamba-ssm to runner",8,3,4,https://github.com/tile-ai/TileOPs/pull/774
+773,MERGED,2026-04-03T05:27:43Z,2026-04-03T05:01:00Z,[Fix][Benchmark] Add serial validation to correct noisy autotune configs,106,38,3,https://github.com/tile-ai/TileOPs/pull/773
+771,MERGED,2026-04-03T03:17:31Z,2026-04-03T02:17:34Z,[Fix][Benchmark] Upgrade baseline from FA2 to FA3,53,41,8,https://github.com/tile-ai/TileOPs/pull/771
+751,MERGED,2026-04-01T09:02:07Z,2026-04-01T08:37:47Z,[Refactor][Bench] Make torch-ref baseline a fallback when no external libraries available,95,95,11,https://github.com/tile-ai/TileOPs/pull/751
+747,MERGED,2026-04-01T08:12:20Z,2026-04-01T08:08:11Z,[Fix][Bench] Fix 405B benchmark failures: FlashInfer group_size guard and rmsnorm xfail,19,2,3,https://github.com/tile-ai/TileOPs/pull/747
+742,MERGED,2026-04-01T06:51:26Z,2026-04-01T06:29:02Z,[Bench] Redesign GQA benchmark params to match real LLM workloads,95,11,3,https://github.com/tile-ai/TileOPs/pull/742
+740,MERGED,2026-04-01T05:11:12Z,2026-04-01T05:08:47Z,[Fix][Bench] Fix FlashInfer GQA decode: use decode kernel instead of prefill,30,9,1,https://github.com/tile-ai/TileOPs/pull/740
+734,MERGED,2026-04-01T03:40:18Z,2026-03-31T13:34:43Z,[Bench] Add FA3/FlashInfer baselines across all attention benchmarks,554,71,10,https://github.com/tile-ai/TileOPs/pull/734
+728,CLOSED,,2026-03-31T08:15:01Z,"[Refactor][Op] Split decode kernels into no-split, splitKV, and combine",955,332,10,https://github.com/tile-ai/TileOPs/pull/728
+721,MERGED,2026-04-03T03:23:45Z,2026-03-31T07:23:01Z,[CI][Bench] Add flashinfer-python to benchmark dependencies,11,4,2,https://github.com/tile-ai/TileOPs/pull/721
+717,MERGED,2026-03-31T04:48:42Z,2026-03-31T02:58:33Z,[Bench][Op] Add FLA baseline for GatedDeltaNetDecode,29,2,1,https://github.com/tile-ai/TileOPs/pull/717
+715,MERGED,2026-03-31T04:48:16Z,2026-03-31T02:15:41Z,[Fix][Op] MHC-Pre kernel ZeroDivisionError on medium config,4,3,2,https://github.com/tile-ai/TileOPs/pull/715
+713,MERGED,2026-03-31T04:47:48Z,2026-03-30T12:46:57Z,[Fix][Bench] Remove obsolete cupti_session fixture causing 7x overhead,1,184,2,https://github.com/tile-ai/TileOPs/pull/713
+710,CLOSED,,2026-03-30T10:33:29Z,[Fix][Bench] Use shared CuptiSession in FFT benchmark to eliminate profiler overhead,191,183,4,https://github.com/tile-ai/TileOPs/pull/710
+708,MERGED,2026-03-30T12:26:12Z,2026-03-30T09:23:23Z,[Feat][FFT] Add native batch support to FFTC2COp,185,178,4,https://github.com/tile-ai/TileOPs/pull/708
+703,MERGED,2026-03-30T05:37:58Z,2026-03-30T05:08:29Z,[Refactor][FFT] Consolidate c2c and lut FFT into single FFTC2COp,649,1143,15,https://github.com/tile-ai/TileOPs/pull/703
+702,MERGED,2026-03-30T04:51:11Z,2026-03-30T03:47:23Z,[Refactor][Bench] Migrate 4 legacy do_bench benchmarks to bench_kernel,35,86,5,https://github.com/tile-ai/TileOPs/pull/702
+700,MERGED,2026-03-29T05:11:17Z,2026-03-29T05:07:25Z,[CI] Speed up nightly packaging job from 31min to ~1min,13,11,10,https://github.com/tile-ai/TileOPs/pull/700
+697,MERGED,2026-03-28T23:41:27Z,2026-03-28T17:50:43Z,[Perf][Bench] Overhaul benchmark infrastructure with SOL-ExecBench protocol,314,201,10,https://github.com/tile-ai/TileOPs/pull/697
+688,MERGED,2026-03-28T05:17:13Z,2026-03-28T01:45:24Z,[CI] Fix python -c IndentationError in nightly workflow,11,13,1,https://github.com/tile-ai/TileOPs/pull/688
+687,MERGED,2026-03-28T00:54:59Z,2026-03-27T14:38:09Z,[CI] Fix workspace ownership with docker chown before checkout,32,5,1,https://github.com/tile-ai/TileOPs/pull/687
+686,MERGED,2026-03-27T14:11:34Z,2026-03-27T13:55:45Z,[CI] Disable checkout clean to avoid root-owned file conflicts,5,0,1,https://github.com/tile-ai/TileOPs/pull/686
+685,MERGED,2026-03-27T13:23:02Z,2026-03-27T13:16:00Z,"[CI] Fix warmup OOM, enable autotuner caching, skip baselines",59,22,3,https://github.com/tile-ai/TileOPs/pull/685
+684,CLOSED,,2026-03-27T13:12:52Z,"[CI] Fix warmup OOM, enable autotuner caching, skip baselines",253,609,4,https://github.com/tile-ai/TileOPs/pull/684
+682,MERGED,2026-03-27T10:11:28Z,2026-03-27T04:37:23Z,[CI] Use manual docker run for nightly tests with local image,195,588,2,https://github.com/tile-ai/TileOPs/pull/682
+681,MERGED,2026-03-27T04:28:57Z,2026-03-27T03:52:36Z,[CI] Use local Docker image tag for nightly runner,113,4,3,https://github.com/tile-ai/TileOPs/pull/681
+680,MERGED,2026-03-27T03:37:46Z,2026-03-27T02:40:42Z,[CI] Run nightly tests in Docker container with host-based runner,77,84,2,https://github.com/tile-ai/TileOPs/pull/680
+673,MERGED,2026-03-26T07:06:45Z,2026-03-26T04:46:12Z,[Fix][CI] Install external baseline libraries in nightly benchmarks,37,4,4,https://github.com/tile-ai/TileOPs/pull/673
+669,MERGED,2026-03-25T11:10:41Z,2026-03-25T11:06:07Z,[Chore][CI] Remove outdated GitHub templates,0,164,3,https://github.com/tile-ai/TileOPs/pull/669
+659,MERGED,2026-03-25T03:15:06Z,2026-03-25T02:43:47Z,[Fix][Bench] Cap no-split mha_decode threads to prevent LayoutInference crash,7,1,1,https://github.com/tile-ai/TileOPs/pull/659
+657,MERGED,2026-03-25T05:00:58Z,2026-03-24T12:04:31Z,[Fix][Bench] Standardize benchmark baseline tags to match actual implementations (#624),88,88,52,https://github.com/tile-ai/TileOPs/pull/657
+647,MERGED,2026-03-24T07:09:34Z,2026-03-24T05:25:42Z,"[BugFix][Flash-Decode] Split JIT kernels in gqa_decode, mha_decode_paged, gqa_decode_paged",517,257,3,https://github.com/tile-ai/TileOPs/pull/647
+644,MERGED,2026-03-24T04:52:38Z,2026-03-24T03:40:51Z,[BugFix][MHA-Decode] Split JIT kernels to fix out_idx mis-resolution,132,88,1,https://github.com/tile-ai/TileOPs/pull/644
+635,MERGED,2026-03-23T13:07:16Z,2026-03-23T12:40:29Z,[Fix][Bench] Fix 11 nightly benchmark failures and report omission,55,8,6,https://github.com/tile-ai/TileOPs/pull/635
+633,MERGED,2026-03-24T07:12:41Z,2026-03-23T12:27:27Z,[Feat] Add DeltaNet (ungated) chunkwise and recurrence ops,2967,0,16,https://github.com/tile-ai/TileOPs/pull/633
+626,MERGED,2026-03-23T07:46:02Z,2026-03-23T06:48:30Z,"[Fix][Bench] Fix nightly report: broken summary, formatting, missing baselines",128,94,4,https://github.com/tile-ai/TileOPs/pull/626
+623,MERGED,2026-03-23T07:46:51Z,2026-03-23T02:58:46Z,[Fix][Bench] Add torch SDPA fallback baseline when FA3 is missing,146,2,4,https://github.com/tile-ai/TileOPs/pull/623
+621,MERGED,2026-03-21T09:11:31Z,2026-03-21T03:31:57Z,[Chore] Standardize benchmark format rules and add Claude enforcement,38,8,3,https://github.com/tile-ai/TileOPs/pull/621
+620,MERGED,2026-03-23T01:52:37Z,2026-03-21T03:15:06Z,"[CI] Add Op-level nightly report with correctness, performance, and regression tracking",878,197,56,https://github.com/tile-ai/TileOPs/pull/620
+602,MERGED,2026-03-19T10:59:54Z,2026-03-19T10:23:04Z,[Chore] Codify lru_cache builder rule into DEVELOPMENT.md and .claude/rules,1,0,1,https://github.com/tile-ai/TileOPs/pull/602
+600,MERGED,2026-03-19T12:32:24Z,2026-03-19T09:59:57Z,[Perf] Add lru_cache to remaining 40 builder functions,117,0,40,https://github.com/tile-ai/TileOPs/pull/600
+597,MERGED,2026-03-19T08:57:24Z,2026-03-19T08:41:59Z,"[Perf] Add lru_cache to builder functions (gated_deltanet, flash_attn, flash_decode)",32,0,11,https://github.com/tile-ai/TileOPs/pull/597
+592,MERGED,2026-03-19T07:25:46Z,2026-03-19T06:20:11Z,[Refactor][LinearAttn] Rename files to match DEVELOPMENT.md convention,45,47,30,https://github.com/tile-ai/TileOPs/pull/592
+564,MERGED,2026-03-18T05:36:31Z,2026-03-18T03:51:23Z,[Fix][MoE] Lower small-batch expert threshold to prevent JIT hang,4,1,1,https://github.com/tile-ai/TileOPs/pull/564
+554,MERGED,2026-03-17T14:16:55Z,2026-03-17T11:34:08Z,[Feat][GLA] Add GLA decode kernel,961,1,7,https://github.com/tile-ai/TileOPs/pull/554
+548,MERGED,2026-03-17T08:36:37Z,2026-03-17T07:34:46Z,"[BugFix][CI] Fix warmup error handling, monkeypatch cleanup, and portable cache paths",32,20,3,https://github.com/tile-ai/TileOPs/pull/548
+542,MERGED,2026-03-17T07:25:12Z,2026-03-17T03:36:44Z,[CI] Separate kernel compilation from profiling and parallelize compilation in nightly,315,5,5,https://github.com/tile-ai/TileOPs/pull/542
+534,MERGED,2026-03-16T13:07:55Z,2026-03-16T10:22:26Z,[Feat][Linear-Attn] Add GLA forward and backward operators,2136,0,10,https://github.com/tile-ai/TileOPs/pull/534
+528,MERGED,2026-03-16T05:01:50Z,2026-03-16T03:44:26Z,[BugFix][Benchmark] Remove redundant gated deltanet benchmarks and add fla fallback,136,509,3,https://github.com/tile-ai/TileOPs/pull/528
+520,MERGED,2026-03-15T11:11:50Z,2026-03-15T10:45:31Z,[Fix][MHC] Fix MHC pre auto-tuning: sigmoid serialization and scalar params,50,11,2,https://github.com/tile-ai/TileOPs/pull/520
+518,MERGED,2026-03-15T11:06:14Z,2026-03-15T10:01:09Z,[Fix][MHA] Fix MHA decode auto-tuning failure for scalar params,39,3,2,https://github.com/tile-ai/TileOPs/pull/518
+514,CLOSED,,2026-03-15T03:10:20Z,[CI] Add history-based benchmark rotation for nightly runs,191,3,3,https://github.com/tile-ai/TileOPs/pull/514
+488,MERGED,2026-03-14T04:09:06Z,2026-03-13T12:43:34Z,"[CI] fix nightly reliability: timeout, cascade failure, and add full op_test job",105,6,1,https://github.com/tile-ai/TileOPs/pull/488
+476,MERGED,2026-03-15T11:12:33Z,2026-03-13T05:43:45Z,[BugFix][Linear-Attn] Cleanup dead kernels and add custom_op wrappers,1424,1096,14,https://github.com/tile-ai/TileOPs/pull/476
+461,MERGED,2026-03-12T06:56:58Z,2026-03-12T06:00:40Z,[Fix][Linear-Attn] Add FP32 decode kernel to fix TF32 truncation in multi-step decode,216,4,4,https://github.com/tile-ai/TileOPs/pull/461
+454,MERGED,2026-03-11T11:36:40Z,2026-03-11T08:23:08Z,"[Perf][Linear-Attn] Optimize Gated DeltaNet fwd, bwd and add decode kernel",1116,554,15,https://github.com/tile-ai/TileOPs/pull/454
+414,MERGED,2026-03-10T04:06:24Z,2026-03-10T01:52:55Z,[Feat][Engram] Add Engram module operators: GateConv fwd/bwd + fused decode,2057,0,13,https://github.com/tile-ai/TileOPs/pull/414
+378,MERGED,2026-03-07T12:09:51Z,2026-03-06T06:55:46Z,[Perf][FFT] Add radix-8 butterfly fusion for fft_c2c_lut,223,11,1,https://github.com/tile-ai/TileOPs/pull/378
+366,MERGED,2026-03-08T08:39:45Z,2026-03-06T04:10:58Z,[Feat][Linear-Attn] Add Gated DeltaNet forward and backward operators,2342,0,12,https://github.com/tile-ai/TileOPs/pull/366
+343,MERGED,2026-03-05T08:08:14Z,2026-03-05T04:16:35Z,[Refactor][Skill] Extract TileLang facts and case studies from skills to wiki KB,117,430,3,https://github.com/tile-ai/TileOPs/pull/343
+311,MERGED,2026-03-04T10:19:09Z,2026-03-04T08:07:06Z,[Chore][Skill] add check-kernel-format skill and kernel-op-conventions doc,217,0,3,https://github.com/tile-ai/TileOPs/pull/311
+306,MERGED,2026-03-04T08:33:00Z,2026-03-04T02:49:23Z,"[Feat][FFT_C2C] add 1D C2C FFT kernels (fft_c2c, fft_c2c_lut) with SMEM fusion and twiddle LUT",1076,43,9,https://github.com/tile-ai/TileOPs/pull/306
+244,MERGED,2026-02-28T09:34:41Z,2026-02-28T07:50:31Z,"[Perf][GEMV] Fix coalescing, add cp.async pipeline, expand test coverage",790,28,6,https://github.com/tile-ai/TileOPs/pull/244
+243,CLOSED,,2026-02-28T07:37:08Z,"[PERF][GEMV] Fix coalescing, add cp.async pipeline, expand test coverage",790,28,6,https://github.com/tile-ai/TileOPs/pull/243
+237,MERGED,2026-02-28T04:32:48Z,2026-02-28T03:37:54Z,[Docs][Tooling] Add creating-issue skill for Claude Code,99,0,1,https://github.com/tile-ai/TileOPs/pull/237
+227,CLOSED,,2026-02-27T05:47:55Z,[Chore][CI] Add commit-msg hook and commit skill to enforce message convention,236,5,5,https://github.com/tile-ai/TileOPs/pull/227
+214,CLOSED,,2026-02-26T10:26:44Z,[Feat][GLA] Add GLA (Gated Linear Attention) Forward Operator (L2),1630,48,9,https://github.com/tile-ai/TileOPs/pull/214
+172,MERGED,2026-02-25T08:40:19Z,2026-02-09T05:41:37Z,[BugFix][mHC] Address numerical instability in the mHC kernel,33,82,6,https://github.com/tile-ai/TileOPs/pull/172
+165,MERGED,2026-02-06T03:51:25Z,2026-02-04T08:05:21Z,[Feat] Implement paged KV cache in flash-decoding kernels,1622,1,13,https://github.com/tile-ai/TileOPs/pull/165
+161,MERGED,2026-01-28T13:10:46Z,2026-01-28T04:07:21Z,[Feat][mHC] Implement mHC kernels,883,2,11,https://github.com/tile-ai/TileOPs/pull/161
+101,MERGED,2026-01-14T08:54:05Z,2026-01-07T09:32:30Z,[BugFix] Support varying length and assigning data type in MHA_decode and GQA_decode kernels,202,81,6,https://github.com/tile-ai/TileOPs/pull/101
+95,CLOSED,,2026-01-07T07:46:58Z,Add files via upload,852,741,2,https://github.com/tile-ai/TileOPs/pull/95
