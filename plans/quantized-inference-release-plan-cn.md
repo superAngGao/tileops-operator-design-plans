@@ -80,6 +80,82 @@ full FP8 Q/K/V Tensor Core prefill:
   适合 prefill / large tile compute；它不是 KV cache decode contract 的替代品。
 ```
 
+### 2.2 GEMM / Linear 需求应按权重量化格式来拆
+
+Linear / GEMM 是大多数模型量化最直接的落点。这里不要先抽象成“quantized matmul”，而要先区分权重格式、activation scale、packed layout 和 serving-time compute：
+
+| 模型 / 后端 | 公开量化形态 | GEMM 侧核心需求 | 对 TileOps 的第一批含义 |
+| --- | --- | --- | --- |
+| Qwen3 / Qwen serving benchmark | BF16、FP8、GPTQ、AWQ 都是公开 benchmark 口径 | 需要 FP8 W8A8、W4A16 / W8A16 weight-only、AWQ/GPTQ packed layout 对齐 | 先补 `GemmFwdOp` / `GroupedGemmFwdOp` manifest，再挂 FP8 / weight-only variants |
+| Llama 4 Scout / Maverick | Scout 提到 on-the-fly INT4；Maverick 发布 FP8 quantized weights | FP8 Linear 和 INT4 weight-only Linear 都是直接需求 | `FP8LinearW8A8FwdOp` 与 `WeightOnlyLinearW4A16FwdOp` 都应进入候选 |
+| DeepSeek-V3 | 技术报告和权重说明强调 FP8 mixed precision、activation 1x128 scaling、weight 128x128 block scaling | 需要 fine-grained FP8 GEMM：activation scale 与 weight block scale 都进入 compute contract | 第一批 FP8 GEMM 不能只支持 per-tensor scale，应把 1x128 / 128x128 作为目标 shape |
+| Kimi K2 Thinking / Kimi3 方向 | Kimi K2 Thinking 使用 native INT4 weight-only，主要用于 MoE components | INT4 weight-only 更可能先落在 expert GEMM / grouped GEMM，而不是普通 dense Linear | weight-only GEMM contract 要能被 MoE expert path 复用 |
+| vLLM / SGLang / Marlin-style backends | AWQ、GPTQ、Marlin、compressed-tensors 是 serving 里常见格式 | TileOps 不做离线 calibration，但需要接收已量化 packed weight、scale、zero metadata | loader / calibration 在 scope 外；kernel contract 只覆盖 serving-time dequant + matmul |
+
+因此，GEMM / Linear 的第一批不是一个万能接口，而是三条稳定线：
+
+```text
+1. FP8 W8A8 GEMM / Linear:
+   x_fp8, w_fp8, x_scale, w_scale -> y(fp16/bf16/fp32 accumulation policy)
+
+2. Weight-only INT4 / INT8 Linear:
+   x(fp16/bf16), w_packed_int4/int8, scale, optional zero -> y
+
+3. Quantized grouped GEMM:
+   expert-routed activations + packed expert weights + per-expert/block scales -> expert output
+```
+
+TileOps 应该把 packed layout、scale shape、zero-point policy、accumulation dtype、output dtype 写进 manifest。AWQ/GPTQ/QAT calibration、checkpoint conversion 和 loader policy 不进入 TileOps kernel scope。
+
+### 2.3 MoE 需求应按 expert compute 路径来拆
+
+MoE 的量化不是“routing 量化”，而是 routed token 到 expert GEMM 之间的 serving hot path。Qwen MoE、DeepSeek MoE、Kimi K2/K3、Llama 4 Maverick 都让 MoE 成为第一批需要重点覆盖的 consumer family。
+
+| 模型 / 后端 | MoE 形态 | 量化压力点 | 对 TileOps 的第一批含义 |
+| --- | --- | --- | --- |
+| Qwen3 MoE / newer Qwen MoE | routed experts + top-k combine；公开 benchmark 覆盖多种量化格式 | expert weight-only / FP8 GEMM、dispatch 后 activation quant、top-k weighted combine | 先做 compositional path：permute -> quantized grouped GEMM -> activation -> quantized grouped GEMM -> unpermute/combine |
+| DeepSeek-V3 MoE | FP8 mixed precision 与 MoE dispatch 强绑定 | routed activations、per-expert / block scale、grouped GEMM accumulation | 需要 scale-aware grouped GEMM，而不是普通 dense GEMM wrapper |
+| Kimi K2 / Kimi K2 Thinking / Kimi3 方向 | 大 MoE，top-k routing；Thinking 公开 native INT4 weight-only | INT4 expert weights、shared/routed expert policy、packed loader boundary | `QuantizedMoeExpertsFwdOp` 应优先支持 INT4 weight-only grouped expert compute |
+| Llama 4 Maverick | MoE + FP8 quantized weights | FP8 expert weights 与 standard serving GEMM 路径复用 | MoE path 应能复用 FP8 GEMM / grouped GEMM contract |
+
+第一批 MoE 不直接追求巨大 fused kernel。合理起点是把下面这些边界固定住：
+
+```text
+activation after routing:
+  hidden_states_perm -> optional activation quantize
+
+expert compute:
+  grouped GEMM with per-expert / per-block scale metadata
+
+combine:
+  expert output -> weighted combine by topk_weights -> token order output
+```
+
+后续是否 fuse `dequant + grouped GEMM + activation + combine`，应由 benchmark 决定。
+
+### 2.4 Activation / Norm / Helper 需求应按 consumer 来拆
+
+Activation / norm / helper 不应该因为“量化”两个字就膨胀成独立主线。它们只有在下游 consumer 需要稳定 scale contract 时才成为第一批目标。
+
+| Consumer | 为什么需要 helper | TileOps 应补的能力 |
+| --- | --- | --- |
+| FP8 GEMM / DeepSeek-style FP8 path | activation 需要按 1x128 或类似 tile 生成 scale | `amax + scale update + quantize`，并记录 nonfinite / saturation diagnostics |
+| Weight-only GEMM | activation 通常保持 fp16/bf16，但可能需要 dequant output epilogue | dequant / scale application 可以留在 GEMM epilogue，不必单独抽 op |
+| MoE expert path | dispatch 后 token layout 改变，activation quantize 的位置会影响性能 | routed activation quantize helper、per-expert scale metadata |
+| FP8 KV cache | KV write 需要 scale 生成；decode read 需要 scale-aware consumer | KV-shaped quantize、paged scale metadata；独立 dequant 只作为 reference/debug |
+| RMSNorm / fused add norm 后接 W8A8 Linear | norm output 立刻进入 FP8 GEMM 时，norm+quantize 可能成为真实 serving boundary | 先记录为 optional fusion，等 GEMM consumer 稳定后再决定是否抽 `RMSNormQuantizeFwdOp` |
+
+第一批 helper 的边界应更像 shared contract，而不是模型算子：
+
+```text
+amax / scale update
+scale-aware FP8 quantize
+scale-aware dequantize for reference/fallback
+packed-layout helper only when GEMM/MoE/KV cache has confirmed reuse
+```
+
+这也是为什么本文不新建 `quantized_inference` family：helper 是横切能力，真正的 op 归属仍由 consumer family 决定。
+
 ## 3. TileOps 当前能力与按 Family 拆分的缺口
 
 ### 3.1 已有能力
@@ -709,8 +785,10 @@ end-to-end fused path
 
 - Qwen3 Speed Benchmark, including BF16, FP8, GPTQ and AWQ results: https://qwen.readthedocs.io/en/latest/getting_started/speed_benchmark.html
 - Llama 4 Scout / Maverick model card and quantization notes: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E
+- Llama 4 Maverick FP8 model card: https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8
 - Meta Llama 4 release blog: https://ai.meta.com/blog/llama-4-multimodal-intelligence/
 - DeepSeek-V3 Technical Report, FP8 training and fine-grained quantization: https://arxiv.org/html/2412.19437v1
+- DeepSeek-V3 FP8 weight file documentation: https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/README_WEIGHTS.md
 - MoonshotAI Kimi K2 repository: https://github.com/moonshotai/kimi-k2
 - Kimi K3 technical blog, KDA / QAT / prefill-cache context: https://www.kimi.com/blog/kimi-k3
 - Kimi K2 Thinking model card, native INT4 quantization: https://huggingface.co/moonshotai/Kimi-K2-Thinking
