@@ -55,35 +55,204 @@ quantize / pack / scale metadata
 
 ### 3.2 按现有 Family 拆分的缺口
 
-| Family / 方向 | 已有能力 | 主要缺口 | 对应模型需求 |
+这一节是后续工作的主轴。它不是简单列“还缺什么”，而是把每个现有 family 需要补的量化能力拆成：
+
+```text
+current anchor -> missing contract -> first PR boundary -> not in scope
+```
+
+这样可以避免两个常见误区：
+
+```text
+1. 把量化重新包装成一个独立 family；
+2. 直接从模型名跳到巨大 fused kernel，跳过 manifest / scale / layout / reference contract。
+```
+
+#### 3.2.1 总览
+
+| Family / 方向 | 当前 anchor | 主要缺口 | 下一步动作 |
 | --- | --- | --- | --- |
-| `attention` | FP8 GQA prefill tensor-core path；FP8 LightingIndexer | FP8 decode with quantized KV cache、FP8 KV cache quantize/dequant、paged KV scale metadata、quantized MLA/KDA/linear-attention variants | vLLM FP8 KV cache、Llama/Qwen FP8 attention、DeepSeek MLA / Kimi KDA 后续量化 |
-| `moe` | routing / permute / unpermute / grouped expert abstraction；prepare/finalize quant hook | quantized routed experts、quantized shared expert、activation quantization after dispatch、per-expert scale metadata、W4A16 / FP8 expert GEMM | Qwen MoE、DeepSeek-V3、Kimi K2/K3、Llama 4 Maverick |
-| `gemm` / `grouped_gemm` | dense GEMM / grouped GEMM kernels exist, plus MoE grouped compute path | FP8 W8A8 Linear、weight-only W4A16 / W8A16 Linear、AWQ/GPTQ/Marlin-like packed layouts、scale/zero metadata；manifest family 也需要补齐 | Qwen AWQ/GPTQ/FP8、Llama INT4 / FP8、Kimi INT4 |
-| `elementwise` / `reduction` / layout helpers | fp8 elementwise benchmarks、local `FP8QuantOp` | amax/scale update、quantize/dequantize、pack/unpack、transpose+pack、saturation counters、scale statistics | all quantized serving paths need common helpers |
-| `normalization` / activation | RMSNorm / LayerNorm / activation kernels | fused norm + quantize, activation + quantize, residual + quantize epilogues only when they are measured serving boundaries | W8A8 activation paths, MoE activation dispatch |
-| `linear_attn` / `sequence_modeling` | GDN/KDA/GLA/SSD-style kernels in progress | quantized state/KV/cache representation, quantized prepare/replay, FP8/INT4 low-rank/state kernels | DeepSeek MLA, Kimi KDA, Qwen linear-attention style future work |
+| `elementwise` / `reduction` / layout helpers | `FP8QuantOp`、fp8 elementwise benchmark | amax / scale update / dequant / pack metadata 不统一 | 先补共享 helper contract |
+| `gemm` / `grouped_gemm` | `tileops/ops/gemm.py`、`tileops/ops/grouped_gemm.py`、benchmarks | 缺 manifest；缺 FP8 W8A8 / W4A16 layout contract | 先补 GEMM manifest，再挂量化 variant |
+| `moe` | routing、permute、unpermute、grouped expert abstraction | 缺 quantized expert weights、activation quant、per-expert scale | 先做 compositional quantized expert path |
+| `attention` | FP8 GQA prefill tensor-core path；FP8 LightingIndexer；bf16/fp16 decode / paged decode | 缺 FP8 KV cache quant/dequant、FP8 decode、paged scale metadata | 先做 dense FP8 KV decode contract，再进 paged |
+| `normalization` / activation | RMSNorm / LayerNorm / fused add norm | 缺 norm/activation + quantize epilogue 的稳定边界 | 等 GEMM / MoE 明确消费后再抽 |
+| `linear_attn` / `sequence_modeling` | GDN/KDA/GLA/SSD-style kernels in progress | 缺 quantized state/KV/cache representation | 先记录模型 contract，暂不抢第一批实现 |
 
 这个拆分的核心是：量化功能不单独形成顶层 family。每个 op 回到它的计算语义 family 中，量化只作为 dtype / layout / metadata contract 出现在 signature、shape rules、dtype combos、workloads 和 roofline 中。
 
-### 3.3 Manifest 层的前置缺口
+#### 3.2.2 Shared helpers：`elementwise` / `reduction` / layout
 
-当前 `tileops/ops/gemm.py`、`tileops/ops/grouped_gemm.py` 和对应 benchmark 已经存在，但 `tileops/manifest/` 里还没有独立的 `gemm.yaml` / `grouped_gemm.yaml`。因此量化 GEMM 不能直接跳到 `FP8LinearW8A8FwdOp` 或 `WeightOnlyLinearW4A16FwdOp` 的实现 PR；需要先把 dense GEMM / grouped GEMM 的 manifest 归属补上。
+这是所有量化路径的共同前置层。TileOps 已经有 `FP8QuantOp` 和 fp8 elementwise benchmark，但它们还没有变成可被 `attention`、`moe`、`gemm` 共同引用的量化 tensor contract。
 
-这不是要新建 `quantized_inference` family，而是把已有 GEMM 语义纳入 manifest source of truth：
+需要补齐的不是“更多 cast kernel”，而是这些可复用语义：
 
 ```text
-gemm.yaml:
-  GemmFwdOp
-  FP8LinearW8A8FwdOp
-  WeightOnlyLinearW4A16FwdOp
+amax / scale update:
+  x -> scale_out
 
-grouped_gemm.yaml:
-  GroupedGemmFwdOp
-  QuantizedGroupedGemmFwdOp
+scale-aware quantize:
+  x, optional scale_in -> x_quant, scale_out
+
+scale-aware dequantize:
+  x_quant, scale -> x_dequant
+
+layout / pack helper:
+  dense quantized tensor -> packed tensor, only when a consumer family needs it
 ```
 
-MoE 的 quantized expert compute 可以复用 grouped GEMM contract，但 manifest 入口仍放在 `moe` family 中；`grouped_gemm` 负责可复用的低层计算语义，`moe` 负责 top-k routing、expert layout、shared/routed expert 和 combine 语义。
+第一批 PR 边界：
+
+```text
+FP8QuantizeFwdOp
+FP8DequantizeFwdOp
+scale shape rules
+rounding / clamp / saturation policy
+nonfinite policy
+reference implementation and diagnostics
+```
+
+暂不提前做一个万能 `QuantizedTensorPackFwdOp`。pack / transpose / swizzle 只有在 `gemm`、`moe` 或 KV cache 的第一批 layout 确认需要复用时才独立出来；否则它应该先留在 owning consumer family 里。
+
+#### 3.2.3 GEMM：`gemm` / `grouped_gemm`
+
+这是推理量化最直接的计算主路径。Qwen AWQ/GPTQ/FP8、Llama INT4/FP8、Kimi INT4、DeepSeek FP8 最终都会落到 dense GEMM、linear 或 grouped GEMM 的 scale-aware compute 上。
+
+当前问题分两层：
+
+```text
+manifest gap:
+  TileOps 有 gemm / grouped_gemm op 和 benchmark，
+  但 manifest 目录中还没有 gemm.yaml / grouped_gemm.yaml。
+
+quantization gap:
+  缺 FP8 W8A8 Linear；
+  缺 W4A16 / W8A16 weight-only Linear；
+  缺 AWQ / GPTQ / Marlin-like / compressed-tensors packed layout contract；
+  缺 scale / zero metadata 的 shape rules。
+```
+
+第一批 PR 边界应该先从普通 GEMM manifest 开始：
+
+```text
+GemmFwdOp
+GroupedGemmFwdOp
+```
+
+然后再挂量化 variant：
+
+```text
+FP8LinearW8A8FwdOp
+WeightOnlyLinearW4A16FwdOp
+QuantizedGroupedGemmFwdOp, if MoE needs a reusable grouped compute contract
+```
+
+不进入 TileOps kernel scope 的部分：
+
+```text
+AWQ / GPTQ calibration
+QAT training
+checkpoint conversion
+engine loader policy
+```
+
+TileOps 接收的是已经量化好的权重、scale、zero-point 和 packed layout，并负责 serving-time fused dequant / matmul / accumulation / output。
+
+#### 3.2.4 MoE：`moe`
+
+MoE 是最需要量化补齐的 consumer family。TileOps 已有 routing、permute、unpermute、grouped expert abstraction，以及 prepare/finalize 中的 quantization hook；但 expert compute 主路径仍然主要是 bf16/fp16。
+
+MoE 的量化缺口不能只写成“加一个 int4 GEMM”。真正的 op contract 需要同时覆盖：
+
+```text
+routed expert weights:
+  w_gate_up, w_down 的 quantized layout
+
+shared expert:
+  是否共享同一 quantization policy，是否和 routed expert fused
+
+activation quantization:
+  dispatch 后 hidden_states 是否在线量化
+
+per-expert scale metadata:
+  scale shape 是否按 expert / group / block 组织
+
+combine:
+  topk_weights 和 unpermute / combine 是否和 dequant output fused
+```
+
+第一批应先做 compositional baseline，而不是直接写巨大 fused kernel：
+
+```text
+permute
+  -> optional activation quantize
+  -> quantized grouped GEMM
+  -> activation
+  -> quantized grouped GEMM
+  -> unpermute / topk weighted combine
+```
+
+这个 baseline 的价值是把 correctness、layout、scale 和 model-shaped workload 先固定住。等它稳定后，再决定哪些边界值得 fused：
+
+```text
+dequant + grouped GEMM
+activation + quantize
+down projection + topk weighted combine
+shared expert + routed expert
+```
+
+#### 3.2.5 Attention：`attention`
+
+Attention 里已经有 FP8 GQA prefill tensor-core path，也有普通 GQA/MHA decode 和 paged decode。缺口不在“有没有 attention”，而在 decode 阶段能否稳定消费 quantized KV cache。
+
+第一批要把 KV cache 的 scale contract 讲清楚：
+
+```text
+FP8KVCacheQuantizeFwdOp:
+  K/V -> K_fp8, V_fp8, K_scale, V_scale
+
+GQADecodeWithFP8KVCacheFwdOp:
+  Q + FP8 K/V cache + scale metadata -> O
+```
+
+落地顺序应该是：
+
+```text
+1. dense / non-paged FP8 KV cache reference
+2. decode attention correctness against bf16/fp16 KV reference
+3. per-tensor and per-head scale
+4. paged cache layout and block table integration
+```
+
+不应该把 paged allocator、block table policy、serving engine memory manager 塞进 TileOps quantization op。TileOps 只负责 quantized KV read / dequant / attention compute 这个 kernel boundary。
+
+#### 3.2.6 Normalization / activation
+
+Norm 和 activation 不应该为了“量化完整性”单独膨胀。它们只有在成为真实 serving boundary 时才进入第一批。
+
+典型进入条件：
+
+```text
+RMSNorm output is immediately consumed by W8A8 Linear;
+MoE activation output must be quantized before second expert GEMM;
+residual + norm + quantize fusion is a measured bottleneck.
+```
+
+否则，普通 RMSNorm / LayerNorm / activation 仍归普通 `normalization` 或 elementwise family，不因为输入输出 dtype 是 fp8/int8 就变成新的量化算子线。
+
+#### 3.2.7 Linear attention / sequence modeling
+
+GDN、KDA、GLA、SSD、MLA 这类 state / cache / recurrence 算子未来会有量化需求，但它们的量化 contract 比 dense attention 更容易和模型实现绑定：
+
+```text
+state dtype
+state scale granularity
+low-rank cache layout
+prepare / replay 中的 scale placement
+decode state update correctness
+```
+
+因此这一类先不抢第一批实现。第一批只做需求记录和 contract inventory；等具体模型的 public implementation、checkpoint metadata、serving runtime contract 稳定后，再在 owning family 下设计量化 variant。
 
 ## 4. 共享 Metadata / Layout Contract
 
@@ -142,7 +311,7 @@ per-page or per-cache-block scale, if paged KV uses it
 
 ## 5. 第一批核心目标：按现有 Family 落地
 
-第一批不追求覆盖所有量化算法，而是补齐最能支撑现代推理路径的四条线。每条线都落到现有 family 中。
+第一批不追求覆盖所有量化算法，而是沿着 3.2 的 family 拆分补齐最能支撑现代推理路径的关键缺口。每条线都落到现有 family 中。
 
 ### 5.0 优先级总表
 
