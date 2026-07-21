@@ -78,21 +78,54 @@ GQA 的量化需求不能只写成“支持 FP8 KV cache”。对不同模型和
    q + fp8 pages + scale metadata + block_table + cache_seqlens -> o
 ```
 
-计算上有三种层级，需要在 tracking issue 中明确：
+计算实现应按两个维度区分：第一，FP8 KV cache 是否在 attention consumer 中融合读取和 scale application；第二，QK / P*V 使用 A16 还是 FP8 Tensor Core compute。tracking issue 至少应明确以下实现形态：
 
 ```text
-storage-only fallback:
-  读 fp8 K/V -> 在线 dequant 到 fp16/bf16 中间值 -> 普通 attention math
-  优点是 contract 简单；缺点是 latency gain 主要来自 cache footprint / bandwidth，不一定来自 Tensor Core compute。
+materialized-dequant fallback:
+  读 fp8 K/V cache -> 独立 dequantize 路径生成完整 fp16/bf16 K/V 中间 tensor
+  -> 调用普通 attention kernel。
 
-fused scale-aware attention:
-  读 fp8 K/V + scale -> 在 QK / PV 路径中直接应用 scale
-  这是 decode hot path 更应该追求的形态。
+  该路径 contract 和 reference 实现较简单，适合作为 correctness fallback；
+  但因为会写出并重新读取完整 A16 K/V，中间流量可能抵消大部分 decode latency 收益。
+  主要价值是减小持久化 cache footprint，而不是 serving hot-path 性能。
 
-full FP8 Q/K/V Tensor Core prefill:
-  q/k/v 可以全部 fp8；QK 和/或 P*V 阶段是否使用 FP8 Tensor Core、
-  softmax intermediate dtype、scale placement 和 accumulation policy 都由 backend contract 决定。
-  适合 prefill / large tile compute；它不是 KV cache decode contract 的替代品。
+fused dequantized attention with A16 compute:
+  attention kernel 直接读取 fp8 K/V 和 scale；
+  在 register / shared-memory tile 内完成反量化；
+  随后使用 fp16/bf16 QK 和 P*V compute；
+  不生成完整的 A16 K/V global-memory intermediate。
+
+  该路径不一定使用 FP8 Tensor Core，但仍能保留 FP8 KV cache 带来的 HBM bandwidth 收益，
+  是现实的 decode hot-path implementation。
+
+fused FP8 Tensor-Core attention:
+  attention kernel 直接消费 fp8 K/V；
+  Q 可以保持 fp16/bf16 后在 kernel 内量化，也可以由上游直接提供 fp8 Q。
+  QK 和/或 P*V 是否采用 FP8 Tensor Core、softmax intermediate dtype、
+  scale granularity、scale placement 和 accumulation policy，均由具体 backend contract 决定。
+
+  large-tile prefill 通常更容易发挥 FP8 Tensor Core 吞吐，但 FP8 Tensor-Core compute
+  也可以用于 decode。现有 dense FP8 Q/K/V prefill kernel 不能替代 paged KV-cache decode
+  contract；decode 路径仍需单独定义 page layout、block table、cache sequence length、
+  scale metadata 和 q_len 边界。
+```
+
+无论选择哪种 fused implementation，scale metadata 都必须进入 contract，而不是留给 kernel 私下解释：
+
+```text
+scale granularity:
+  per-tensor / per-attention-head / per-page / per-block / per-token-block
+
+scale indexing dimension:
+  scale 如何随 batch、head、page、KV block 或 token block 索引
+
+scale placement:
+  K scale 如何进入 QK score，是否能与 softmax scale 合并；
+  V scale 如何进入 P*V partial accumulation，何时做 output rescale。
+
+softmax interaction:
+  如果 K scale 随 KV block 变化，score tile 必须在 online softmax 前应用对应 scale；
+  如果 V scale 随 KV block 变化，PV contribution 必须在 online accumulation 合并前应用对应 scale。
 ```
 
 ### 2.2 GEMM / Linear 需求应按权重量化格式来拆
@@ -209,7 +242,7 @@ current anchor -> missing contract -> first PR boundary -> not in scope
 | `elementwise` / `reduction` / layout helpers | `FP8QuantOp`、fp8 elementwise benchmark | amax / scale update / dequant / pack metadata 不统一 | 先补共享 helper contract |
 | `gemm` / `grouped_gemm` | `tileops/ops/gemm.py`、`tileops/ops/grouped_gemm.py`、benchmarks | 缺 manifest；缺 FP8 W8A8 / W4A16 layout contract | 先补 GEMM manifest，再挂量化 variant |
 | `moe` | routing、permute、unpermute、grouped expert abstraction | 缺 quantized expert weights、activation quant、per-expert scale | 先做 compositional quantized expert path |
-| `attention` | FP8 GQA compute path；FP8 LightingIndexer；KV-shaped `FP8QuantOp`；bf16/fp16 decode / paged decode | 底层已有 fp8 K/V + scale 读取能力；缺 decode/cache-facing manifest contract、paged scale metadata、reference / benchmark coverage | 按模型需求先做 dense FP8 KV cache read contract，再进 paged；storage-only dequant 只作为 fallback / reference |
+| `attention` | FP8 GQA compute path；FP8 LightingIndexer；KV-shaped `FP8QuantOp`；bf16/fp16 decode / paged decode | 底层已有 fp8 K/V + scale 读取能力；缺 decode/cache-facing manifest contract、paged scale metadata、reference / benchmark coverage | 按模型需求先做 dense FP8 KV cache read contract，再进 paged；materialized dequant 只作为 fallback / reference |
 | `normalization` / activation | RMSNorm / LayerNorm / fused add norm | 缺 norm/activation + quantize epilogue 的稳定边界 | 等 GEMM / MoE 明确消费后再抽 |
 | `linear_attn` / `sequence_modeling` | GDN/KDA/GLA/SSD-style kernels in progress | 缺 quantized state/KV/cache representation | 先记录模型 contract，暂不抢第一批实现 |
 
@@ -364,7 +397,7 @@ output_tensor: [batch, seq_len_kv, kv_group, index_dim], dtype=float8_e4m3fn
 3. 缺 dense decode / q_len=1 / cache-read 场景的 reference、shape rules 和 benchmark；
 4. 缺 paged KV cache 下 scale metadata 与 block_table 的形状约定；
 5. 缺 decode output correctness against bf16/fp16 KV reference；
-6. storage-only dequant helper 只在 reference/debug 或非 fused fallback 需要时独立成 op，热路径优先走 fused scale-aware consumer。
+6. materialized-dequant helper 只在 reference/debug 或非 fused fallback 需要时独立成 op，热路径优先走 fused consumer，包括 fused dequantized A16 compute 或 fused FP8 Tensor-Core attention。
 ```
 
 第一批要把 KV cache 的 scale contract 和 decode/cache-facing wrapper 讲清楚：
@@ -379,15 +412,15 @@ GQADecodeWithFP8KVCacheFwdOp:
   在 shape contract 覆盖 decode/cache-read 场景时复用现有 FP8 GQA compute
 ```
 
-这里的计算目标不是先把整个 KV cache 解量化回 bf16/fp16 再调用普通 decode。第一版可以保留 storage-only fallback 作为 reference，但服务热路径应该是：
+这里的计算目标不是先把整个 KV cache 解量化回 bf16/fp16 再调用普通 decode。第一版可以保留 materialized-dequant fallback 作为 reference，但服务热路径应该是：
 
 ```text
 Q(fp16/bf16) + K/V(fp8) + scale
-  -> scale-aware QK / PV
+  -> fused scale application in QK / P*V
   -> O(fp16/bf16)
 ```
 
-完整 FP8 Q/K/V Tensor Core prefill 是另一条已有能力，适合 large prefill tile；它不能替代 decode 侧的 FP8 KV cache contract。
+已有 dense FP8 Q/K/V Tensor-Core prefill 是另一条能力，适合 large prefill tile；它不能替代 decode 侧的 FP8 KV cache contract，因为 decode 仍需要 page layout、block table、cache sequence length、scale metadata 和 q_len 边界。
 
 落地顺序应该是：
 
@@ -398,7 +431,7 @@ Q(fp16/bf16) + K/V(fp8) + scale
 4. paged cache layout and block table integration
 ```
 
-不应该把 paged allocator、block table policy、serving engine memory manager 塞进 TileOps quantization op。TileOps 只负责 quantized KV read / dequant / attention compute 这个 kernel boundary。
+不应该把 paged allocator、block table policy、serving engine memory manager 塞进 TileOps quantization op。TileOps 只负责 quantized KV read、scale application 和 attention compute 这个 kernel boundary。
 
 #### 3.2.6 Normalization / activation
 
@@ -632,7 +665,7 @@ GQADecodeWithFP8KVCacheFwdOp(
 # 复用现有 FP8 GQA compute。
 ```
 
-第一版可以先做 dense reference / non-paged smoke，再进入 paged cache contract。不要把 paged allocator 和 block table policy 塞进 quantization op；TileOps 只负责可测的 quantized KV read / scale application / attention compute。是否需要独立 dequant op，取决于 reference/debug/fallback 是否需要；主热路径不应该为了形式完整而强制拆出 dequant。
+第一版可以先做 dense reference / non-paged smoke，再进入 paged cache contract。不要把 paged allocator 和 block table policy 塞进 quantization op；TileOps 只负责可测的 quantized KV read / scale application / attention compute。materialized dequant op 只在 reference/debug/fallback 需要时独立出现；主热路径不应该为了形式完整而强制拆出完整 A16 K/V 中间 tensor。
 
 ## 6. 第二批目标
 
