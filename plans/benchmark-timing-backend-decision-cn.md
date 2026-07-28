@@ -17,6 +17,15 @@
 
 这两个方案都试图解决同一个问题：现有 CUPTI benchmark 依赖 Kineto 将 CPU `record_function` window 投影到 GPU timeline。实际 nightly 中，projection count 经常不是 `50/50`，导致大量 case fallback 到 CUDA event，而 CUDA event 对短 kernel 会包含明显 launch overhead。
 
+### 1.1 关联 PR / Issue
+
+| 链接 | 关系 |
+| --- | --- |
+| [tile-ai/TileOPs#1797](https://github.com/tile-ai/TileOPs/pull/1797) | 当前实现 PR：CUPTI single-kernel sampling + multi-kernel CUDA event fallback |
+| [tile-ai/TileOPs#1796](https://github.com/tile-ai/TileOPs/issues/1796) | follow-up issue：跟踪 benchmark CUPTI fallback / projection mismatch 问题 |
+| [tile-ai/TileOPs#1795](https://github.com/tile-ai/TileOPs/pull/1795) | 早期分析 PR：通过 nightly 结果展示 fallback 的普遍性，后续思路被 #1797 吸收 |
+| [Nightly run 30170991562](https://github.com/tile-ai/TileOPs/actions/runs/30170991562) | 触发本轮分析的 nightly benchmark 报告 |
+
 ## 2. 现有问题
 
 当前 CUPTI 路径的核心流程是：
