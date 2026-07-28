@@ -56,32 +56,6 @@ CUDA kernel events = 49 或 50 或其他值
 
 旧实现要求 `projected windows == n_repeat`。只要 projection 不是 `50/50`，即使 CUPTI activity 中已经有可用 kernel duration，也会 fallback 到 CUDA event。
 
-### 2.1 是否存在“半截 kernel duration”
-
-当前判断是：CUPTI / Kineto 的 CUDA kernel activity event 本身通常不会被记录成“半截 duration”。kernel event 的基本单位是一次完整 kernel launch，包含 start 和 duration。只要这个 kernel event 被捕获，duration 应该是完整 kernel duration，而不是被 projected annotation window 裁剪后的半截时间。
-
-真正危险的是另一件事：**logical call sample 可能被截断或无法证明完整**。
-
-例如一次 logical call launch 多个 kernel：
-
-```text
-call i -> kernel A + kernel B + kernel C
-```
-
-如果只依赖 projected window 过滤，projection 丢失或边界不稳定时，可能出现：
-
-```text
-call i 的 window 没有 projected
-  -> 这次 call 完全不计入 CUPTI sample
-
-或 projected window / 过滤条件只覆盖部分 kernel
-  -> 这次 call 只统计到 B + C
-```
-
-这不是单个 kernel duration 被截半，而是一次 logical call 的 kernel set 不完整。对于 multi-kernel op，这会让 `kernel duration sum / count` 没有明确语义。
-
-因此，不应使用“按 duration 排序，丢掉最短 kernel”这类 heuristic。短 kernel 可能是真实业务 kernel；partial sample 也不一定最短。排序无法证明 denominator 正确。
-
 ## 3. 方案 A：NCU Benchmark Backend
 
 ### 3.1 实现方法
@@ -204,7 +178,13 @@ multi-kernel op:
     -> fallback CUDA event
 ```
 
-### 4.2 优点
+### 4.2 正确性补充：不会统计半截 kernel duration
+
+CUPTI / Kineto 的 CUDA kernel activity event 是 kernel 粒度事件。只要一个 kernel event 被捕获，它的 duration 应该对应完整 kernel launch，而不是被 projected annotation window 裁剪后的半截时间。
+
+因此，single-kernel op 出现 `49/50` projection mismatch 时，更合理的理解是捕获到了 49 次完整 sampled calls，而不是捕获到了 50 次 call 里的某些半截 kernel。方案 B 正是利用这一点：只在 classification 证明“一次 logical call 只有一个 business kernel”后，才允许用 sampled kernel count 作为 denominator。
+
+### 4.3 优点
 
 | 优点 | 说明 |
 | --- | --- |
@@ -214,7 +194,7 @@ multi-kernel op:
 | 解决主要 fallback 来源 | single-kernel fast ops 是 CUDA event launch overhead 最明显的受害者，`49/50` 可继续使用 CUPTI |
 | 风险边界清晰 | multi-kernel 不做 kernel-count 推断，保守走 CUDA event |
 
-### 4.3 缺点
+### 4.4 缺点
 
 | 缺点 | 说明 |
 | --- | --- |
@@ -224,7 +204,7 @@ multi-kernel op:
 | kernel name 仍参与 single-kernel 判定 | kernel name 不用于 dispatch matching，但用于判定 classification 是否稳定 single-kernel |
 | 不能作为 profiler 诊断替代品 | 它是 benchmark timing fix，不是完整 kernel-level analysis tool |
 
-### 4.4 适用边界
+### 4.5 适用边界
 
 该方案适合成为默认 benchmark 后端策略：
 
