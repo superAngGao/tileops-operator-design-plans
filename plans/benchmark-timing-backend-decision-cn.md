@@ -34,7 +34,7 @@
 fallback 到 CUDA Events。
 
 最新证据见
-[`plans/gqa/nightly-cuda-events-fallback-analysis-2026-07-29.md`](gqa/nightly-cuda-events-fallback-analysis-2026-07-29.md)：
+[`plans/benchmark-timing-nightly-evidence-cn.md`](benchmark-timing-nightly-evidence-cn.md)：
 
 - run #183 有 2,835 条 `cuda-events` report rows；
 - run #187 仍有 146 条，其中 GQA 68 条；

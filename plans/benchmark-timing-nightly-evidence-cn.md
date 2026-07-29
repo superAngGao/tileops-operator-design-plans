@@ -1,4 +1,4 @@
-# Nightly CUDA Events fallback 事实与原因归因（2026-07-29）
+# TileOps Benchmark Timing：Nightly 事实、误差与历史污染
 
 ## 结论
 
@@ -6,7 +6,7 @@ TileOps 最新成功 Nightly（run
 [#187](https://github.com/tile-ai/TileOPs/actions/runs/30417463015)，commit
 [`db4494c`](https://github.com/tile-ai/TileOPs/commit/db4494c59149b4270278680f2c5761c62c360877)）
 的 `profile_run.log` 中共有 **146 条 benchmark result 被标记为
-`timing = cuda-events`**，其中 **68 条属于 GQA**。
+`timing = cuda-events`**。其中 GQA 68 条，其他算子族 78 条。
 
 这里的“146 次”以 benchmark report 的结果行为统计单位：每一行代表一次
 `bench_kernel` 测量结果在 CUPTI 投影校验失败后，改用 CUDA Events 重新测量。
@@ -31,9 +31,9 @@ launch overhead，并使小于 10 μs 的 fast kernel 延迟膨胀约 6–7 倍�
 `bench_gated_deltanet_prefill.py` 的 workload 名称，不是 timing fallback。
 真正的 timing backend 记录在 artifact 的 report 表格中。
 
-## 事实分布
+## 最新 Nightly 的 fallback 分布
 
-### GQA：68 条
+### GQA 算子：68 条
 
 | Op | `cuda-events` 条数 |
 | --- | ---: |
@@ -46,7 +46,7 @@ launch overhead，并使小于 10 μs 的 fast kernel 延迟膨胀约 6–7 倍�
 | `GroupedQueryAttentionSlidingWindowFwdOp` | 15 |
 | **GQA 小计** | **68** |
 
-### 非 GQA：78 条
+### 其他算子：78 条
 
 | Op / report section | `cuda-events` 条数 |
 | --- | ---: |
