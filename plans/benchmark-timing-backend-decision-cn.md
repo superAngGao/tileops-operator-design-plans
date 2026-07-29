@@ -35,6 +35,37 @@
 
 因此，本文后面的推荐方案还需要一个数据治理前提：timing backend 是 benchmark record 的 provenance，不只是说明字段。无论最终采用 NCU 方案还是 CUPTI sampling 方案，benchmark history 和 regression report 都必须能区分 CUPTI、CUDA Events、NCU diagnostic 和 unknown backend。
 
+### 1.2 实施状态与最新运行证据
+
+截至 2026-07-29，方案 A 和方案 B **都未合入 main**。本文件后续的方案 B
+仍是推荐设计，不是当前 Nightly 已部署的行为。main 上继续使用旧规则：
+只要 projected annotation window 数不等于 `n_repeat`，整个 measurement
+fallback 到 CUDA Events。
+
+最新证据见
+[`plans/benchmark-timing-nightly-evidence-cn.md`](benchmark-timing-nightly-evidence-cn.md)：
+
+- run #183 有 2,835 条 `cuda-events` report rows；
+- run #187 仍有 146 条，其中 GQA 68 条；
+- perf history 没有保存 timing backend，fallback latency 已和 CUPTI latency
+  混在同一个 14-day history 中；
+- run #187 报告的 602 项 improvement 大量来自 backend 切换；
+- 38 项 regression 中有 34 项当前值使用 CUDA Events，不能视为可信的
+  kernel regression；
+- run #183 与 #187 的 886 个同名 workload 配对中，旧值/新值中位数
+  2.13x，180 对大于等于 5x；由于 commit 不同，这是历史污染证据，不是
+  纯 backend A/B。
+
+这补充了本 decision 原先缺少的一层约束：timing backend 不只是实现细节，
+而是 benchmark record 的 provenance。无论最终选择 A 或 B，都必须先保证：
+
+```text
+1. timing backend 随每条记录进入 perf history；
+2. regression/best 只比较可比 backend；
+3. unknown 或 fallback 数据不能静默参与正式性能结论；
+4. 用同 commit 受控 A/B 量化 absolute bias 和 relative ratio。
+```
+
 ## 2. 现有问题
 
 当前 CUPTI 路径的核心流程是：
