@@ -21,10 +21,19 @@
 
 | 链接 | 关系 |
 | --- | --- |
-| [tile-ai/TileOPs#1797](https://github.com/tile-ai/TileOPs/pull/1797) | 当前实现 PR：CUPTI single-kernel sampling + multi-kernel CUDA event fallback |
+| [tile-ai/TileOPs#1797](https://github.com/tile-ai/TileOPs/pull/1797) | 未合并的实现探索：CUPTI single-kernel sampling + multi-kernel CUDA event fallback |
 | [tile-ai/TileOPs#1796](https://github.com/tile-ai/TileOPs/issues/1796) | follow-up issue：跟踪 benchmark CUPTI fallback / projection mismatch 问题 |
-| [tile-ai/TileOPs#1795](https://github.com/tile-ai/TileOPs/pull/1795) | 早期分析 PR：通过 nightly 结果展示 fallback 的普遍性，后续思路被 #1797 吸收 |
+| [tile-ai/TileOPs#1795](https://github.com/tile-ai/TileOPs/pull/1795) | 未合并的早期分析 PR：通过 nightly 结果展示 fallback 的普遍性 |
 | [Nightly run 30170991562](https://github.com/tile-ai/TileOPs/actions/runs/30170991562) | 触发本轮分析的 nightly benchmark 报告 |
+| [superAngGao/tileops-operator-design-plans#1](https://github.com/superAngGao/tileops-operator-design-plans/pull/1) | 补充事实分析：区分可证明的直接触发、上游根因假设和 history 污染 |
+
+### 1.2 实施状态与证据边界
+
+截至 2026-07-29，方案 A 和方案 B 都还没有合入 TileOps `main`。本文讨论的是后续 benchmark timing backend 的设计取舍，不是当前 Nightly 已部署的行为。当前 `main` 仍使用旧规则：只要 projected annotation window 数不等于 `n_repeat`，整次 measurement 就 fallback 到 CUDA Events。
+
+最新补充分析显示，Nightly run #187 仍有 146 条 benchmark report rows 使用 `cuda-events`，其中 GQA 68 条、非 GQA 78 条；run #183 曾有 2,835 条 `cuda-events` rows。由于 `perf_history.json` 没有保存 timing backend，fallback latency 已经和 CUPTI latency 混入同一条历史比较路径。
+
+因此，本文后面的推荐方案还需要一个数据治理前提：timing backend 是 benchmark record 的 provenance，不只是说明字段。无论最终采用 NCU 方案还是 CUPTI sampling 方案，benchmark history 和 regression report 都必须能区分 CUPTI、CUDA Events、NCU diagnostic 和 unknown backend。
 
 ## 2. 现有问题
 
@@ -64,6 +73,8 @@ CUDA kernel events = 49 或 50 或其他值
 ```
 
 旧实现要求 `projected windows == n_repeat`。只要 projection 不是 `50/50`，即使 CUPTI activity 中已经有可用 kernel duration，也会 fallback 到 CUDA event。
+
+从现有 artifact 可以严格证明的直接触发是 `n_regions != n_repeat`。但如果日志没有持久化每次失败的 `n_regions/n_repeat`、captured CUDA kernel count 和 workload/tag，就不能进一步把上游根因写死为某个具体 Kineto、CUPTI、runner 或 callable 组件的问题。
 
 ## 3. 方案 A：NCU Benchmark Backend
 
@@ -241,7 +252,7 @@ CUPTI / Kineto 的 CUDA kernel activity event 是 kernel 粒度事件。只要�
 
 ## 6. 推荐决策
 
-推荐默认路线采用 **方案 B：CUPTI single-kernel sampling + multi-kernel CUDA event fallback**。
+推荐后续默认路线采用 **方案 B：CUPTI single-kernel sampling + multi-kernel CUDA event fallback**。
 
 理由是：
 
@@ -266,7 +277,7 @@ optional diagnostic:
 
 ## 7. 后续工作
 
-### 7.1 当前 PR 应处理
+### 7.1 短期实现应处理
 
 ```text
 1. 保留现有 per-repeat profiler window，不引入 big window。
@@ -279,10 +290,12 @@ optional diagnostic:
 ### 7.2 后续 issue 可处理
 
 ```text
-1. 增加可选 NCU diagnostic runner，只跑指定 nodeid / op。
-2. 在 report 中统计 CUPTI / CUDA event / NCU diagnostic 的比例。
-3. 对 dynamic-dispatch op 记录 classification kernel names 和 fallback 原因。
-4. 如果未来需要 multi-kernel pure GPU wall latency，再评估 nsys 或 CUPTI activity start/end span，而不是 kernel duration sum。
+1. 将 timing backend、fallback reason 和 CUPTI mismatch 诊断持久化到 benchmark result / JUnit / perf history。
+2. regression、best 和 improvement 只比较可比 timing backend；旧 history 中缺失 backend 的记录应标为 unknown。
+3. 增加可选 NCU diagnostic runner，只跑指定 nodeid / op。
+4. 在 report 中统计 CUPTI / CUDA event / NCU diagnostic 的比例。
+5. 对 dynamic-dispatch op 记录 classification kernel names 和 fallback 原因。
+6. 如果未来需要 multi-kernel pure GPU wall latency，再评估 nsys 或 CUPTI activity start/end span，而不是 kernel duration sum。
 ```
 
 ## 8. 结论
@@ -291,4 +304,4 @@ NCU 方案从机制上更干净地绕开 Kineto projection，适合作为诊断�
 
 CUPTI single-kernel sampling + multi-kernel CUDA event fallback 方案不试图解决所有 profiler 问题，而是把可安全使用 CUPTI 的范围收窄到 single-kernel callable。它可以让 `49/50` 这类 partial projection sample 正常产生 kernel-only latency，同时避免对 multi-kernel op 做不可靠 denominator 推断。
 
-因此，默认 benchmark 路线应选择 CUPTI single-kernel sampling 方案；NCU 保留为后续可选 diagnostic backend。
+因此，后续默认 benchmark 路线应选择 CUPTI single-kernel sampling 方案；NCU 保留为后续可选 diagnostic backend。
