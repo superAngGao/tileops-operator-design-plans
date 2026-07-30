@@ -6,23 +6,7 @@
 
 TileOps 最初希望 benchmark 基础设施对齐 NVIDIA SOL-ExecBench：固定 warmup/repeat/trial、L2 flush、输入地址扰动、锁频和稳定报告口径。实际落地时，TileOps 采用了 `torch.profiler` / Kineto 暴露的 CUPTI CUDA activity，并通过 `record_function` projection 判断每个 repeat 的 GPU 计时窗口。
 
-重新核对 NV SOL 代码后，需要纠正一个历史混淆：NV SOL 当前默认 timing methodology 是 **native CUPTI activity timing**，不是 PyTorch/Kineto projection，也不是 NCU。TileOps 和 NV SOL 的核心差异不是“是否使用 CUPTI”，而是：
-
-```text
-NV SOL:
-  native CUPTI activity
-  + discovery sequence
-  + per-iteration CUPTI timestamp window
-  + sequence matching
-
-TileOps current:
-  torch.profiler / Kineto CUDA activity
-  + CPU record_function
-  + Kineto projected GPU annotation window
-  + regions == n_repeat gate
-```
-
-当前问题集中在 TileOps 对 Kineto projection 的依赖：当 projected annotation window 数不是 `n_repeat` 时，benchmark fallback 到 CUDA events。CUDA events 对 fast kernels 会带入 launch overhead，使 nightly latency 和 roofline 数据不可直接与 CUPTI kernel-only history 混合比较。
+重新核对 NV SOL 代码后，需要纠正一个历史混淆：NV SOL 当前默认 timing methodology 是 **native CUPTI activity timing**。当前 TileOps 的主要问题集中在 Kineto projection 依赖：当 projected annotation window 数不是 `n_repeat` 时，benchmark fallback 到 CUDA events。CUDA events 对 fast kernels 会带入 launch overhead，使 nightly latency 和 roofline 数据不可直接与 CUPTI kernel-only history 混合比较。
 
 ## 1. NV SOL 的具体流程
 
@@ -31,7 +15,7 @@ TileOps current:
 - NVIDIA SOL-ExecBench timing code: https://github.com/NVIDIA/SOL-ExecBench/blob/main/src/sol_execbench/core/bench/timing.py
 - CUPTI utility code: https://github.com/NVIDIA/SOL-ExecBench/blob/main/src/sol_execbench/core/bench/cupti_utils.py
 
-NV SOL 的默认 timing backend 是 `methodology="cupti"`。它使用 Python CUPTI binding 直接开启 CUPTI activity collection，主要采集：
+NV SOL 的默认 timing backend 是 `methodology="cupti"`。它使用 Python CUPTI binding 开启 GPU activity collection，主要采集：
 
 ```text
 CONCURRENT_KERNEL
@@ -39,9 +23,9 @@ MEMCPY
 MEMSET
 ```
 
-它不依赖 `torch.profiler.record_function` 投影，也不要求每个 Python annotation 在 GPU timeline 上变成一个 projected region。
+这三类 activity 覆盖了 benchmark 中最常见的 GPU work：kernel launch、显式/隐式 memcpy，以及 memset/clear cache 相关操作。SOL 后续会从这些 activity 中识别用户调用对应的序列，并用这个序列进行正式计时归因。
 
-### 1.1 Warmup 与准备
+### 1.1 Iteration 准备
 
 每个 iteration 前，NV SOL 会执行 `prepare_iteration()`：
 
@@ -52,7 +36,11 @@ clear L2 cache buffer
 optional torch.cuda.synchronize()
 ```
 
-随后先做 warmup：
+这一步把“准备输入”和“准备硬件状态”收在同一个入口里。`setup args` 允许每次 iteration 使用新参数或新地址；reset persisting L2 cache 和 clear L2 cache buffer 让每次测量尽量从一致的 cache 状态开始；可选 synchronize 用来在需要时把准备阶段的 GPU work drain 掉，避免它和后续用户调用混在一起。
+
+### 1.2 Warmup
+
+正式测量前，NV SOL 会先执行 warmup：
 
 ```text
 torch.cuda.synchronize()
@@ -64,7 +52,7 @@ torch.cuda.synchronize()
 
 warmup 的目的不是计时，而是让 JIT、autotune、library initialization 和冷启动状态尽量退出正式测量窗口。
 
-### 1.2 Discovery iteration
+### 1.3 Discovery iteration
 
 正式计时前，NV SOL 先单独跑一次 discovery：
 
@@ -82,9 +70,9 @@ expected_kernel_names
 expected_kernel_counts
 ```
 
-这一步很关键：NV SOL 不是简单数 kernel 个数，也不是把所有 CUPTI activity duration 直接求和；它先识别“这一次 logical call 应该对应什么 GPU activity 序列”。
+这一步的目的是建立“用户调用应该长什么样”的 GPU activity 指纹。后续正式计时不会盲目使用一个 window 内的全部 activity，而是尝试从 window 内选出和 discovery 一致的 activity sequence。这样可以把 setup/cache/helper noise 和被测用户调用区分开。
 
-### 1.3 Timed iterations
+### 1.4 Timed iterations
 
 正式计时时，NV SOL 在同一个 CUPTI collection window 中跑 `rep` 次。每次 logical iteration 的 CPU timestamp window 用 CUPTI 自己的 timestamp API 标记：
 
@@ -95,9 +83,9 @@ torch.cuda.synchronize()
 end_cpu = cupti.get_timestamp()
 ```
 
-这里 `end_cpu` 放在 `torch.cuda.synchronize()` 之后，所以本次 call 发出的 CUDA work 会完整落在这个 CPU timestamp window 内。
+这里的 `start_cpu` / `end_cpu` 使用 CUPTI timestamp，和 CUPTI activity 使用同一套时间基准。`end_cpu` 放在 `torch.cuda.synchronize()` 之后，目的是确保本次 call 发出的 CUDA work 已经完成，窗口内可以包含本次 logical iteration 的完整 GPU activity。
 
-### 1.4 Attribution 与 latency
+### 1.5 Attribution 与 latency
 
 CUPTI collection 结束后，NV SOL 会把所有 GPU activity 按 start/end/correlation id 排序。对每个 iteration：
 
@@ -108,10 +96,10 @@ CUPTI collection 结束后，NV SOL 会把所有 GPU activity 按 start/end/corr
 4. latency = max(activity.end) - min(activity.start)
 ```
 
-这带来两个重要性质：
+这里有两个关键设计点：
 
-1. **支持 multi-kernel logical call**：latency 是这一组 activity 的 GPU span，不是 kernel duration sum，也不是 kernel count denominator。
-2. **不依赖 Kineto projection**：logical call boundary 来自 CUPTI timestamp window + sequence matching，而不是 CPU annotation projected region。
+1. **用 sequence 做归因**：正式计时只接受和 discovery 一致的 activity sequence；如果找不到预期序列，说明本次测量窗口存在无法解释的噪声或 dispatch 变化，应显式失败。
+2. **用 GPU span 表示 latency**：latency 是这组 activity 的 `max(end) - min(start)`，不是把 kernel duration 简单相加。对于 multi-kernel logical call，这更接近 GPU 侧 operator latency；对于 single-kernel logical call，它退化为单个 kernel duration。
 
 ## 2. TileOps Benchmark 的发展脉络
 
