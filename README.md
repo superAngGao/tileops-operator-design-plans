@@ -6,6 +6,7 @@ This repository collects discussion-stage design plans for TileOps operator fami
 
 | Plan | Scope | Status |
 | --- | --- | --- |
+| [TileOps Benchmark Timing SOL 对齐技术报告](plans/benchmark-timing-sol-alignment-report-cn.md) | NV SOL native CUPTI timing flow, TileOps benchmark history, current Kineto projection issue, and staged improvement strategy | Discussion draft |
 | [TileOps Benchmark 计时后端决策](plans/benchmark-timing-backend-decision-cn.md) | Benchmark timing backend comparison: NCU diagnostic path vs CUPTI single-kernel sampling with CUDA event fallback | Discussion draft |
 | [Cross-Layer 算子族发布计划](plans/cross-layer-ops-release-plan-cn.md) | Cross-layer operator taxonomy, MHC manifest alignment, Block AttnRes path, and adjacent depth/cache mechanisms | Discussion draft |
 | [推理量化功能补齐计划](plans/quantized-inference-release-plan-cn.md) | Quantization gaps across existing TileOps families, including FP8, INT4, MoE experts, GEMM, and KV cache paths | Discussion draft |
