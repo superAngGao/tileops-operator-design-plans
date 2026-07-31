@@ -6,7 +6,35 @@
 
 ## 1. GPU kernel 调度与计时基础
 
-CUDA kernel launch 对 CPU 是异步的。CPU 发出 launch 后通常很快返回，GPU work 被排入 CUDA stream；同一 stream 内的 work 按提交顺序执行，不同 stream 之间可能并发或通过 event / dependency 同步。因此 benchmark 必须明确区分：
+### 1.1 Kernel 在 GPU 上如何启动
+
+CUDA kernel launch 对 CPU 是异步的。CPU 发出 launch 后通常很快返回；CUDA runtime / driver 会把 kernel function、grid/block 形状、参数地址、stream dependency 等信息提交到 GPU 可见的工作队列。GPU 侧调度器随后从队列中取出 work，把 thread blocks 分派到 SM 上执行。
+
+一次 kernel 真正开始跑之前，通常已经需要满足几类前提：
+
+```text
+kernel code 已经编译并加载到当前 CUDA context
+kernel 参数和输入/输出 tensor 地址已经确定
+CUDA stream 里排在它前面的依赖已经完成
+必要的 module / library / handle 初始化已经发生
+GPU 可以访问对应显存页和页表映射
+```
+
+这些动作不都发生在被测 kernel 的 GPU duration 里。比如 JIT 编译、module load、allocator 扩容、library handle 初始化通常发生在第一次调用或 warmup 阶段；CPU launch path 和 driver submit 通常在 host 侧；kernel activity duration 一般从 GPU 上 kernel 开始执行算起。
+
+Cache 状态也需要单独看。GPU 不需要在启动 kernel 前把业务数据“预装”进 cache，kernel 会在执行时按访存指令自然填充 L1/L2。但 benchmark 需要决定 cache 初始状态是否受控：
+
+```text
+warm cache：多次运行同一输入，可能复用 L2 / library cache 状态
+cold-ish cache：每次运行前清 L2 cache buffer，减少上一轮数据残留
+stable cache policy：固定 warmup、flush、同步和输入地址扰动
+```
+
+所以 cache 不是 kernel 启动的必需准备项，但它是 benchmark 可重复性和数据口径的一部分。SOL / Triton / TileOps 这类 microbenchmark 通常会用 warmup 和 L2 flush 来控制这个状态。
+
+### 1.2 为什么要区分不同计时窗口
+
+CPU 发出 launch 后，GPU work 被排入 CUDA stream；同一 stream 内的 work 按提交顺序执行，不同 stream 之间可能并发或通过 event / dependency 同步。因此 benchmark 必须明确区分：
 
 ```text
 CPU 提交窗口：Python/C++ 从开始调用到返回，包含 launch/runtime overhead
