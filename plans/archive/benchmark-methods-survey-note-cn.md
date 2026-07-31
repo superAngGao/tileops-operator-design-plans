@@ -201,6 +201,42 @@ SOL 的关键流程是：
      latency = max(activity.end) - min(activity.start)
 ```
 
+把第 3 步展开看，SOL timed iteration 的时序更像下面这样。左侧的 `start_cpu/end_cpu` 是 `cuptiGetTimestamp()` 取到的 CPU-side attribution window；右侧的 `kernel start/end` 是 CUPTI activity 记录到的 GPU activity 时间。SOL 最终不是用 `end_cpu - start_cpu` 当 latency，而是在这个 attribution window 里选择符合 discovery sequence 的 GPU activities。
+
+```text
+CPU                                             GPU
+─────────────────────────────────────────────────────────────
+
+cuptiGetTimestamp()
+│
+├── start_cpu
+│
+runner(args)
+├── execute Python / PyTorch dispatch
+├── cudaLaunchKernel(...)
+│       └── kernel command enqueued
+├── cudaLaunchKernel(...)
+│       └── another kernel command enqueued
+│
+torch.cuda.synchronize()
+├── CPU blocks or polls                    kernel 1 start
+│                                          kernel 1 execution
+│                                          kernel 1 end
+│
+│                                          kernel 2 start
+│                                          kernel 2 execution
+│                                          kernel 2 end
+│
+└── synchronize returns
+    all related GPU work has completed
+
+cuptiGetTimestamp()
+│
+└── end_cpu
+```
+
+因此 SOL 的 `start_cpu/end_cpu` 更像“归因边界”，不是最终的 GPU latency 本身。只要 CUPTI activity 里的 kernel / memcpy / memset 完整落在这个边界内，SOL 就可以用 activity 的 `min(start)` 到 `max(end)` 得到一次 logical call 的 GPU span。
+
 SOL 的特点是用 discovery sequence 做归因，并用 activity span 表示一次 logical call 的 GPU 侧 latency。对于 single-kernel call，span 退化为 kernel duration；对于 multi-kernel call，它比简单相加 kernel duration 更接近 operator GPU span。
 
 ## 5. PyTorch `torch.utils.benchmark`
