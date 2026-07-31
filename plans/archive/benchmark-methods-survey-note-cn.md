@@ -254,6 +254,45 @@ stop host timer, with accelerator synchronize
 report Measurement
 ```
 
+展开成时序图，大致如下。这里的 `start_host/stop_host` 是 CPU wall timer，不是 CUDA event，也不是 CUPTI kernel activity timestamp；前后的 synchronize 用来保证 GPU 上已有 work 不污染本轮计时，以及本轮提交的 GPU work 在 stop 前全部完成。
+
+```text
+CPU                                             GPU
+─────────────────────────────────────────────────────────────
+
+setup / warmup
+├── prepare stmt environment
+└── accelerator synchronize              previous GPU work drained
+
+host timer start
+│
+├── start_host
+│
+repeat stmt N times
+├── Python / C++ statement dispatch
+├── cudaLaunchKernel(...)
+│       └── kernel command enqueued
+├── Python / C++ statement dispatch
+├── cudaLaunchKernel(...)
+│       └── kernel command enqueued
+│
+accelerator synchronize
+├── CPU blocks or polls                    kernel 1 start
+│                                          kernel 1 execution
+│                                          kernel 1 end
+│
+│                                          kernel 2 start
+│                                          kernel 2 execution
+│                                          kernel 2 end
+│
+└── synchronize returns
+    submitted GPU work has completed
+│
+├── stop_host
+│
+host timer stop
+```
+
 这个方法适合比较 PyTorch statement / module 的 end-to-end 执行时间；它不区分一个 statement 内部到底发了几个 kernel，也不是 kernel-only timing。FlashAttention 早期 benchmark helper 的 `benchmark_forward` / `benchmark_backward` 也主要包了一层 `torch.utils.benchmark.Timer`。
 
 ## 6. Triton `do_bench`
