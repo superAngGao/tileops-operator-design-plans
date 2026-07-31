@@ -25,7 +25,7 @@ CUDA kernel launch 对 CPU 是异步的。CPU 发出 launch 后通常很快返�
 
 因此它们更像一组依赖关系，而不是每次 launch 都重复执行的线性步骤。steady-state benchmark 关心的是：正式计时前这些一次性或偶发性动作是否已经被 warmup/setup 吸收；正式窗口里留下的是 CPU submit、stream 排队、GPU kernel/memcpy/memset activity，还是纯 kernel activity。
 
-先只看 **一个 kernel 被调用一次**。下面这张图的时间轴是从左到右；上半部分是 CPU/Host 侧发起 CUDA API，下半部分是同一条 CUDA stream 在 GPU 侧依次执行 start event、kernel、end event。图里同时标出了三类容易混淆的 timing marker：
+先只看 **一个 kernel 被调用一次**。下面这张图的时间轴是从上到下；左侧是 CPU thread 发起 CUDA API，右侧是 CUDA driver / stream / GPU 侧逐步处理这些 work。图里同时标出了四类容易混淆的 timing marker：
 
 ```text
 CUPTI Runtime/Driver API activity：每个 CUDA API 调用自己的 host-side start/end
@@ -36,58 +36,66 @@ CUPTI activity timestamp：kernel 在 GPU 上真正开始/结束执行的 start/
 
 这是一个对比图：实际 benchmark backend 通常只选择其中一种或两种机制，不一定同时记录 CUDA events、SOL attribution timestamps 和 CUPTI API activities。尤其要注意，`cupti.get_timestamp()` 包住的是 CPU attribution window，不是 `cudaLaunchKernel` 这条 Runtime API 的 CUPTI activity；普通异步 launch 的 API end 通常早于 kernel 在 GPU 上执行完成。
 
-```mermaid
-flowchart LR
-    subgraph CPU["CPU / Host thread"]
-        T0["SOL attribution t0<br/>cupti.get_timestamp()"]
-        EVS_CALL["cudaEventRecord(start_event)"]
-        LAUNCH["launch kernel<br/>kernel&lt;&lt;&lt;grid, block, stream&gt;&gt;&gt;(args)"]
-        EVE_CALL["cudaEventRecord(end_event)"]
-        WAIT["synchronize / wait event"]
-        T1["SOL attribution t1<br/>cupti.get_timestamp()"]
-    end
+```text
+CPU thread                                      Driver / CUDA stream / GPU
+────────────────────────────────────────────────────────────────────────────
 
-    subgraph API["Optional CUPTI Runtime/Driver API activities"]
-        API_EVS["cudaEventRecord(start)<br/>API start/end"]
-        API_LAUNCH["cudaLaunchKernel<br/>API start/end"]
-        API_EVE["cudaEventRecord(end)<br/>API start/end"]
-        API_WAIT["cudaEventSynchronize<br/>API start/end"]
-    end
+SOL attribution t0:
+    cupti.get_timestamp()
 
-    subgraph RT["CUDA runtime / driver submit path"]
-        PACK["package launch config<br/>args / grid / block / shared memory / stream"]
-        SUBMIT["enqueue commands<br/>to the stream submission path"]
-    end
+CUPTI API start: cudaEventRecord(start)
+    cudaEventRecord(start_event, stream)
+                                                 start-event command
+                                                 enters the stream submission path
+CUPTI API end: cudaEventRecord(start)
 
-    subgraph STREAM["CUDA stream queue"]
-        EVS_Q["start_event command"]
-        K_Q["kernel command"]
-        EVE_Q["end_event command"]
-    end
+CUPTI API start: cudaLaunchKernel
+    kernel<<<grid, block, 0, stream>>>(args)
+                                                 kernel launch config is packaged:
+                                                   grid / block / args / shared memory
+                                                 kernel command enters the stream path
+CUPTI API end: cudaLaunchKernel
+    CPU has returned and can continue running
+                                                 command buffer may be submitted
+                                                 independently of CPU progress
 
-    subgraph GPU["GPU scheduler / SMs"]
-        EVS_GPU["CUDA event start timestamp"]
-        PRE_GAP["pre-kernel stream gap<br/>stream dependency resolution<br/>launch command processing<br/>GPU dispatch latency"]
-        K_START["CUPTI activity<br/>kernel_start"]
-        EXEC["execute kernel<br/>CTA dispatch to SMs<br/>resident block resources<br/>instructions, loads/stores"]
-        K_END["CUPTI activity<br/>kernel_end"]
-        POST_GAP["post-kernel stream gap<br/>kernel completion propagation<br/>stream advances to end_event<br/>end_event timestamp recording"]
-        EVE_GPU["CUDA event end timestamp"]
-    end
+CUPTI API start: cudaEventRecord(end)
+    cudaEventRecord(end_event, stream)
+                                                 end-event command
+                                                 enters the stream submission path
+CUPTI API end: cudaEventRecord(end)
 
-    T0 --> EVS_CALL --> LAUNCH --> EVE_CALL --> WAIT --> T1
-    EVS_CALL -.->|host API activity| API_EVS
-    LAUNCH -.->|host API activity| API_LAUNCH
-    EVE_CALL -.->|host API activity| API_EVE
-    WAIT -.->|host API activity| API_WAIT
-    EVS_CALL --> SUBMIT
-    LAUNCH --> PACK --> SUBMIT
-    EVE_CALL --> SUBMIT
-    SUBMIT --> EVS_Q --> K_Q --> EVE_Q
-    EVS_Q --> EVS_GPU --> PRE_GAP
-    K_Q --> PRE_GAP --> K_START --> EXEC --> K_END --> POST_GAP
-    EVE_Q --> POST_GAP --> EVE_GPU
-    EVE_GPU --> WAIT
+                                                 stream reaches start-event command
+                                                 ── CUDA event_start timestamp
+
+                                                 pre-kernel stream gap:
+                                                   stream dependency resolution
+                                                   launch command processing
+                                                   dispatch latency before kernel activity
+
+                                                 ── CUPTI kernel.start
+                                                 kernel execution:
+                                                   CTAs are dispatched to SMs in waves
+                                                   resident blocks use SM registers,
+                                                   shared memory, thread slots
+                                                   instructions, loads/stores execute
+                                                 ── CUPTI kernel.end
+
+                                                 post-kernel stream gap:
+                                                   kernel completion propagates
+                                                   stream advances to end-event command
+
+                                                 stream reaches end-event command
+                                                 ── CUDA event_end timestamp
+
+CUPTI API start: cudaEventSynchronize(end)
+    CPU waits or polls
+                                                 end_event is complete
+    cudaEventSynchronize returns
+CUPTI API end: cudaEventSynchronize(end)
+
+SOL attribution t1:
+    cupti.get_timestamp()
 ```
 
 读这张图时要注意四点：
@@ -113,7 +121,7 @@ CUPTI kernel duration =
 
 这里的 `CTA dispatch / resident block resources` 也不是说 GPU 会在 kernel_start 前为整个 grid 一次性预分配寄存器和 shared memory。更准确地说，grid/block shape、dynamic shared memory、kernel metadata 等已经随 launch command 提交；kernel 执行期间，thread blocks 分批被调度到 SM，成为 resident block 时才占用该 SM 上的 registers、shared memory、thread slots 等资源。
 
-这张图里的箭头表达的是依赖和归属，不表示每次 launch 都会重新执行所有 setup 动作。比如 module load、JIT/autotune、allocator 扩容和 library handle 初始化通常应被 warmup 吸收；正式计时要么测 CPU host wall-time，要么测 CUDA event span，要么测 CUPTI activity，取决于 benchmark 选择的 start/stop 机制。
+这张图表达的是一个 steady-state launch 的常见逻辑顺序，不表示每次 launch 都会重新执行所有 setup 动作，也不承诺 driver 内部一定按图中每一行串行发生。比如 module load、JIT/autotune、allocator 扩容和 library handle 初始化通常应被 warmup 吸收；正式计时要么测 CPU host wall-time，要么测 CUDA event span，要么测 CUPTI activity，取决于 benchmark 选择的 start/stop 机制。
 
 Cache 状态也需要单独看。GPU 不需要在启动 kernel 前把业务数据“预装”进 cache，kernel 会在执行时按访存指令自然填充 L1/L2。但 benchmark 需要决定 cache 初始状态是否受控：
 
