@@ -34,68 +34,57 @@ CUDA event timestamp：event record 在 stream 上执行时产生的 start/end
 CUPTI activity timestamp：kernel 在 GPU 上真正开始/结束执行的 start/end
 ```
 
+图中的颜色在全文保持一致：
+
+```mermaid
+flowchart LR
+    C["CUPTI signal"]:::cupti
+    E["CUDA event signal"]:::event
+    W["CPU wall timer signal"]:::cpuwall
+    O["ordinary work / wait / gap"]:::work
+
+    classDef cupti fill:#DBEAFE,stroke:#2563EB,color:#111827
+    classDef event fill:#FEF3C7,stroke:#D97706,color:#111827
+    classDef cpuwall fill:#DCFCE7,stroke:#16A34A,color:#111827
+    classDef work fill:#F3F4F6,stroke:#6B7280,color:#111827
+```
+
 这是一个对比图：实际 benchmark backend 通常只选择其中一种或两种机制，不一定同时记录 CUDA events、SOL attribution timestamps 和 CUPTI API activities。尤其要注意，`cupti.get_timestamp()` 包住的是 CPU attribution window，不是 `cudaLaunchKernel` 这条 Runtime API 的 CUPTI activity；普通异步 launch 的 API end 通常早于 kernel 在 GPU 上执行完成。
 
-```text
-CPU thread                                      Driver / CUDA stream / GPU
-────────────────────────────────────────────────────────────────────────────
+```mermaid
+flowchart TB
+    subgraph CPU["CPU thread"]
+        T0["SOL attribution t0<br/>cuptiGetTimestamp()"]:::cupti
+        A0["CUPTI API activity<br/>cudaEventRecord(start)<br/>host start/end"]:::cupti
+        A1["CUPTI API activity<br/>cudaLaunchKernel<br/>host start/end"]:::cupti
+        A2["CUPTI API activity<br/>cudaEventRecord(end)<br/>host start/end"]:::cupti
+        A3["CUPTI API activity<br/>cudaEventSynchronize(end)<br/>host start/end"]:::cupti
+        T1["SOL attribution t1<br/>cuptiGetTimestamp()"]:::cupti
+    end
 
-SOL attribution t0:
-    cupti.get_timestamp()
+    subgraph GPU["Driver / CUDA stream / GPU"]
+        Q0["start-event command<br/>enters stream path"]:::work
+        E0["CUDA event_start timestamp"]:::event
+        G0["pre-kernel stream gap<br/>stream dependency resolution<br/>launch command processing<br/>dispatch latency"]:::work
+        K0["CUPTI kernel.start"]:::cupti
+        X0["kernel execution<br/>CTAs dispatched to SMs in waves<br/>resident blocks use SM resources"]:::work
+        K1["CUPTI kernel.end"]:::cupti
+        G1["post-kernel stream gap<br/>kernel completion propagation<br/>stream advances to end event"]:::work
+        E1["CUDA event_end timestamp"]:::event
+        D0["end_event complete"]:::work
+    end
 
-CUPTI API start: cudaEventRecord(start)
-    cudaEventRecord(start_event, stream)
-                                                 start-event command
-                                                 enters the stream submission path
-CUPTI API end: cudaEventRecord(start)
+    T0 --> A0 --> A1 --> A2 --> A3 --> T1
+    A0 -. enqueue .-> Q0
+    A1 -. enqueue .-> G0
+    A2 -. enqueue .-> G1
+    Q0 --> E0 --> G0 --> K0 --> X0 --> K1 --> G1 --> E1 --> D0
+    D0 -. unblocks .-> A3
 
-CUPTI API start: cudaLaunchKernel
-    kernel<<<grid, block, 0, stream>>>(args)
-                                                 kernel launch config is packaged:
-                                                   grid / block / args / shared memory
-                                                 kernel command enters the stream path
-CUPTI API end: cudaLaunchKernel
-    CPU has returned and can continue running
-                                                 command buffer may be submitted
-                                                 independently of CPU progress
-
-CUPTI API start: cudaEventRecord(end)
-    cudaEventRecord(end_event, stream)
-                                                 end-event command
-                                                 enters the stream submission path
-CUPTI API end: cudaEventRecord(end)
-
-                                                 stream reaches start-event command
-                                                 ── CUDA event_start timestamp
-
-                                                 pre-kernel stream gap:
-                                                   stream dependency resolution
-                                                   launch command processing
-                                                   dispatch latency before kernel activity
-
-                                                 ── CUPTI kernel.start
-                                                 kernel execution:
-                                                   CTAs are dispatched to SMs in waves
-                                                   resident blocks use SM registers,
-                                                   shared memory, thread slots
-                                                   instructions, loads/stores execute
-                                                 ── CUPTI kernel.end
-
-                                                 post-kernel stream gap:
-                                                   kernel completion propagates
-                                                   stream advances to end-event command
-
-                                                 stream reaches end-event command
-                                                 ── CUDA event_end timestamp
-
-CUPTI API start: cudaEventSynchronize(end)
-    CPU waits or polls
-                                                 end_event is complete
-    cudaEventSynchronize returns
-CUPTI API end: cudaEventSynchronize(end)
-
-SOL attribution t1:
-    cupti.get_timestamp()
+    classDef cupti fill:#DBEAFE,stroke:#2563EB,color:#111827
+    classDef event fill:#FEF3C7,stroke:#D97706,color:#111827
+    classDef cpuwall fill:#DCFCE7,stroke:#16A34A,color:#111827
+    classDef work fill:#F3F4F6,stroke:#6B7280,color:#111827
 ```
 
 读这张图时要注意四点：
@@ -203,36 +192,36 @@ SOL 的关键流程是：
 
 把第 3 步展开看，SOL timed iteration 的时序更像下面这样。左侧的 `start_cpu/end_cpu` 是 `cuptiGetTimestamp()` 取到的 CPU-side attribution window；右侧的 `kernel start/end` 是 CUPTI activity 记录到的 GPU activity 时间。SOL 最终不是用 `end_cpu - start_cpu` 当 latency，而是在这个 attribution window 里选择符合 discovery sequence 的 GPU activities。
 
-```text
-CPU                                             GPU
-─────────────────────────────────────────────────────────────
+```mermaid
+flowchart TB
+    subgraph CPU["CPU"]
+        S0["start_cpu<br/>cuptiGetTimestamp()"]:::cupti
+        R0["runner(args)<br/>Python / PyTorch dispatch"]:::work
+        L0["cudaLaunchKernel(...)<br/>kernel command enqueued"]:::work
+        L1["cudaLaunchKernel(...)<br/>another kernel command enqueued"]:::work
+        SY0["torch.cuda.synchronize()<br/>CPU blocks or polls"]:::work
+        S1["end_cpu<br/>cuptiGetTimestamp()"]:::cupti
+    end
 
-cuptiGetTimestamp()
-│
-├── start_cpu
-│
-runner(args)
-├── execute Python / PyTorch dispatch
-├── cudaLaunchKernel(...)
-│       └── kernel command enqueued
-├── cudaLaunchKernel(...)
-│       └── another kernel command enqueued
-│
-torch.cuda.synchronize()
-├── CPU blocks or polls                    kernel 1 start
-│                                          kernel 1 execution
-│                                          kernel 1 end
-│
-│                                          kernel 2 start
-│                                          kernel 2 execution
-│                                          kernel 2 end
-│
-└── synchronize returns
-    all related GPU work has completed
+    subgraph GPU["GPU"]
+        K0["CUPTI kernel 1 start"]:::cupti
+        X0["kernel 1 execution"]:::work
+        K1["CUPTI kernel 1 end"]:::cupti
+        K2["CUPTI kernel 2 start"]:::cupti
+        X1["kernel 2 execution"]:::work
+        K3["CUPTI kernel 2 end"]:::cupti
+        D0["all related GPU work complete"]:::work
+    end
 
-cuptiGetTimestamp()
-│
-└── end_cpu
+    S0 --> R0 --> L0 --> L1 --> SY0 --> S1
+    L0 -. queued work .-> K0 --> X0 --> K1 --> K2 --> X1 --> K3 --> D0
+    L1 -. queued work .-> K2
+    D0 -. unblocks .-> SY0
+
+    classDef cupti fill:#DBEAFE,stroke:#2563EB,color:#111827
+    classDef event fill:#FEF3C7,stroke:#D97706,color:#111827
+    classDef cpuwall fill:#DCFCE7,stroke:#16A34A,color:#111827
+    classDef work fill:#F3F4F6,stroke:#6B7280,color:#111827
 ```
 
 因此 SOL 的 `start_cpu/end_cpu` 更像“归因边界”，不是最终的 GPU latency 本身。只要 CUPTI activity 里的 kernel / memcpy / memset 完整落在这个边界内，SOL 就可以用 activity 的 `min(start)` 到 `max(end)` 得到一次 logical call 的 GPU span。
@@ -256,41 +245,40 @@ report Measurement
 
 展开成时序图，大致如下。这里的 `start_host/stop_host` 是 CPU wall timer，不是 CUDA event，也不是 CUPTI kernel activity timestamp；前后的 synchronize 用来保证 GPU 上已有 work 不污染本轮计时，以及本轮提交的 GPU work 在 stop 前全部完成。
 
-```text
-CPU                                             GPU
-─────────────────────────────────────────────────────────────
+```mermaid
+flowchart TB
+    subgraph CPU["CPU"]
+        P0["setup / warmup<br/>prepare stmt environment"]:::work
+        P1["accelerator synchronize<br/>previous GPU work drained"]:::work
+        H0["start_host<br/>CPU wall timer"]:::cpuwall
+        R0["repeat stmt N times<br/>Python / C++ statement dispatch"]:::work
+        L0["cudaLaunchKernel(...)<br/>kernel command enqueued"]:::work
+        L1["cudaLaunchKernel(...)<br/>kernel command enqueued"]:::work
+        SY0["accelerator synchronize<br/>CPU blocks or polls"]:::work
+        H1["stop_host<br/>CPU wall timer"]:::cpuwall
+    end
 
-setup / warmup
-├── prepare stmt environment
-└── accelerator synchronize              previous GPU work drained
+    subgraph GPU["GPU"]
+        D0["previous GPU work drained"]:::work
+        K0["kernel 1 start"]:::work
+        X0["kernel 1 execution"]:::work
+        K1["kernel 1 end"]:::work
+        K2["kernel 2 start"]:::work
+        X1["kernel 2 execution"]:::work
+        K3["kernel 2 end"]:::work
+        D1["submitted GPU work complete"]:::work
+    end
 
-host timer start
-│
-├── start_host
-│
-repeat stmt N times
-├── Python / C++ statement dispatch
-├── cudaLaunchKernel(...)
-│       └── kernel command enqueued
-├── Python / C++ statement dispatch
-├── cudaLaunchKernel(...)
-│       └── kernel command enqueued
-│
-accelerator synchronize
-├── CPU blocks or polls                    kernel 1 start
-│                                          kernel 1 execution
-│                                          kernel 1 end
-│
-│                                          kernel 2 start
-│                                          kernel 2 execution
-│                                          kernel 2 end
-│
-└── synchronize returns
-    submitted GPU work has completed
-│
-├── stop_host
-│
-host timer stop
+    P0 --> P1 --> H0 --> R0 --> L0 --> L1 --> SY0 --> H1
+    P1 -. waits for .-> D0
+    L0 -. queued work .-> K0 --> X0 --> K1 --> K2 --> X1 --> K3 --> D1
+    L1 -. queued work .-> K2
+    D1 -. unblocks .-> SY0
+
+    classDef cupti fill:#DBEAFE,stroke:#2563EB,color:#111827
+    classDef event fill:#FEF3C7,stroke:#D97706,color:#111827
+    classDef cpuwall fill:#DCFCE7,stroke:#16A34A,color:#111827
+    classDef work fill:#F3F4F6,stroke:#6B7280,color:#111827
 ```
 
 这个方法适合比较 PyTorch statement / module 的 end-to-end 执行时间；它不区分一个 statement 内部到底发了几个 kernel，也不是 kernel-only timing。FlashAttention 早期 benchmark helper 的 `benchmark_forward` / `benchmark_backward` 也主要包了一层 `torch.utils.benchmark.Timer`。
