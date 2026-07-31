@@ -25,7 +25,15 @@ CUDA kernel launch 对 CPU 是异步的。CPU 发出 launch 后通常很快返�
 
 因此它们更像一组依赖关系，而不是每次 launch 都重复执行的线性步骤。steady-state benchmark 关心的是：正式计时前这些一次性或偶发性动作是否已经被 warmup/setup 吸收；正式窗口里留下的是 CPU submit、stream 排队、GPU kernel/memcpy/memset activity，还是纯 kernel activity。
 
-用时序图表示，大致是下面这个过程：上半部分是 **CPU/Host 侧行为**，下半部分是 **GPU 侧行为**；`CUDA runtime/driver` 和 `stream queue` 是 CPU 提交工作到 GPU 的边界。
+先只看 **一个 kernel 被调用一次**。下面这张图的时间轴是从上到下；左侧是 CPU/Host 侧发起动作，中间是 CUDA runtime/driver 和 stream queue，右侧是 GPU 执行。图里同时标出了三类 timing marker：
+
+```text
+CUPTI CPU timestamp：SOL-style attribution window 的 start/end
+CUDA event timestamp：event record 在 stream 上执行时产生的 start/end
+CUPTI activity timestamp：kernel 在 GPU 上真正开始/结束执行的 start/end
+```
+
+这是一个对比图：实际 benchmark backend 通常只选择其中一种或两种机制，不一定同时记录 CUDA events 和 CUPTI timestamps。
 
 ```mermaid
 sequenceDiagram
@@ -34,38 +42,38 @@ sequenceDiagram
     participant RT as CUDA runtime / driver
     participant Q as CUDA stream queue
     participant GPU as GPU scheduler / SMs
-    participant MEM as GPU memory / cache
-
-    rect rgb(245, 245, 245)
-        note over CPU,RT: setup / first-call / warmup, usually outside timed window
-        CPU->>RT: call op wrapper
-        RT->>RT: JIT/autotune/module load/library handle init if needed
-        CPU->>RT: allocate or reuse tensors, prepare launch args
-        RT->>MEM: allocate device memory / establish mappings if needed
-        CPU->>RT: warmup launch
-        RT->>Q: enqueue warmup kernel
-        Q->>GPU: release work after earlier stream deps complete
-        GPU->>MEM: execute warmup kernel, fill/use cache
-        GPU-->>CPU: warmup completes after synchronize
-    end
+    participant CUPTI as CUPTI activity buffer
 
     rect rgb(235, 248, 255)
-        note over CPU,GPU: steady-state timed iteration
-        CPU->>RT: start timing boundary, then _run(i)
-        RT->>Q: package args/grid/block/stream and enqueue launch
-        note over CPU,RT: CPU launch returns before GPU work necessarily finishes
-        Q->>GPU: kernel becomes ready after stream deps/events
-        GPU->>MEM: execute instructions, loads/stores, L1/L2 activity
-        GPU-->>Q: kernel activity ends
-        Q-->>CPU: end visible via synchronize / CUDA event / CUPTI collection
-        CPU->>RT: stop timing boundary or read profiler result
+        note over CPU,CUPTI: one steady-state timed call: _run(i)
+        CPU->>CUPTI: CUPTI CPU t0 = cupti.get_timestamp()
+        CPU->>RT: cudaEventRecord(start_event, stream)
+        RT->>Q: enqueue start_event command
+        CPU->>RT: launch kernel<<<grid, block, stream>>>(args)
+        RT->>Q: enqueue kernel command
+        CPU->>RT: cudaEventRecord(end_event, stream)
+        RT->>Q: enqueue end_event command
+        CPU->>RT: synchronize stream/device or wait for event
+
+        Q->>GPU: start_event reaches stream head
+        note over GPU: CUDA event start timestamp
+        Q->>GPU: kernel command becomes ready after prior deps
+        GPU->>CUPTI: CUPTI activity kernel_start
+        GPU->>GPU: execute instructions, loads/stores, L1/L2 activity
+        GPU->>CUPTI: CUPTI activity kernel_end
+        Q->>GPU: end_event reaches stream head
+        note over GPU: CUDA event end timestamp
+
+        RT-->>CPU: synchronize returns
+        CPU->>CUPTI: CUPTI CPU t1 = cupti.get_timestamp()
     end
 ```
 
-读这张图时可以按两条线看：
+读这张图时要注意三点：
 
-- **CPU/Host 线**：调用 Python/C++ wrapper，准备参数，调用 CUDA runtime/driver，把 launch enqueue 到 stream，然后继续执行或在 synchronize/event/profiler 处等待。
-- **GPU 线**：stream 依赖满足后，GPU scheduler 把 blocks 派到 SM；SM 执行指令、访问显存、填充或使用 L1/L2 cache；kernel activity 结束后，结果才对同步或 profiler 可见。
+- `cudaEventRecord()` 的 CPU 调用只是在 stream 里放一个 event command；真正的 CUDA event timestamp 是 event command 在 GPU stream 上执行时产生的。
+- CUPTI activity 的 `kernel_start/kernel_end` 对应 GPU 上 kernel activity 的真实开始和结束。single-kernel 的 pure kernel time 通常就是 `kernel_end - kernel_start`。
+- SOL-style 的 `cupti.get_timestamp()` 在 CPU 侧取 timestamp，用来形成 attribution window `[t0, t1]`；它本身不是 kernel duration，而是帮助从 CUPTI activity buffer 中挑出属于这次 logical call 的 activity。
 
 这张图里的箭头表达的是依赖和归属，不表示每次 launch 都会重新执行所有 setup 动作。比如 module load、JIT/autotune、allocator 扩容和 library handle 初始化通常应被 warmup 吸收；正式计时要么测 CPU host wall-time，要么测 CUDA event span，要么测 CUPTI activity，取决于 benchmark 选择的 start/stop 机制。
 
