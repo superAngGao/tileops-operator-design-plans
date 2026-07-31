@@ -10,17 +10,63 @@
 
 CUDA kernel launch 对 CPU 是异步的。CPU 发出 launch 后通常很快返回；CUDA runtime / driver 会把 kernel function、grid/block 形状、参数地址、stream dependency 等信息提交到 GPU 可见的工作队列。GPU 侧调度器随后从队列中取出 work，把 thread blocks 分派到 SM 上执行。
 
-一次 kernel 真正开始跑之前，通常已经需要满足几类前提：
+一次 kernel 真正开始跑之前，通常已经需要满足几类前提。它们不是严格按下面顺序逐项发生；更准确地说，它们分布在 host runtime、CUDA driver、CUDA context、stream queue 和 GPU 执行侧。对 benchmark 来说，重要的是知道哪些可能落在第一次调用或 warmup 中，哪些才属于正式 kernel 的 GPU activity。
 
-```text
-kernel code 已经编译并加载到当前 CUDA context
-kernel 参数和输入/输出 tensor 地址已经确定
-CUDA stream 里排在它前面的依赖已经完成
-必要的 module / library / handle 初始化已经发生
-GPU 可以访问对应显存页和页表映射
-```
+| 前提 | 主要发生位置 | 典型发生时间 | 是否严格排在 kernel launch 前 |
+| --- | --- | --- | --- |
+| kernel code 已经编译 | NVCC/AOT build、JIT compiler、Triton/TileLang compiler | 安装/构建时，或第一次调用/autotune 时 | 是。没有可执行 device code 就不能 launch |
+| kernel code / module 已加载到当前 CUDA context | CUDA runtime / driver module management | 第一次调用该 kernel、显式 module load，或 lazy loading 触发时 | 逻辑上在该 kernel 执行前；可能由第一次 launch 隐式触发 |
+| kernel 参数和输入/输出 tensor 地址已经确定 | host 侧 Python/C++ runtime、CUDA launch API | 每次 launch 时 | 是。launch command 需要携带参数值、指针、grid/block、shared memory、stream 等信息 |
+| CUDA stream 里排在它前面的依赖已经完成 | GPU work queue / stream scheduler | GPU 执行前，由 stream 顺序和 event dependency 决定 | 是。它决定 kernel 何时能开始执行，但不一定阻塞 CPU launch 返回 |
+| 必要的 library / handle 初始化已经发生 | host runtime、library runtime，例如 cuBLAS/cuDNN/FlashAttention wrapper | 通常在第一次调用、warmup 或显式 setup 阶段 | 对使用该 library 的 callable 是前置条件；不一定是每个底层 kernel 的前置步骤 |
+| GPU 可以访问对应显存页和页表映射 | CUDA memory manager、GPU MMU、Unified Memory/page migration 机制 | `cudaMalloc`/allocator 分配后；managed memory 可能在首次 GPU 访问时迁移或 fault | 普通 device memory 通常已满足；managed/oversubscription 场景可能在 kernel 执行中触发 page fault |
 
 这些动作不都发生在被测 kernel 的 GPU duration 里。比如 JIT 编译、module load、allocator 扩容、library handle 初始化通常发生在第一次调用或 warmup 阶段；CPU launch path 和 driver submit 通常在 host 侧；kernel activity duration 一般从 GPU 上 kernel 开始执行算起。
+
+因此它们更像一组依赖关系，而不是每次 launch 都重复执行的线性步骤。steady-state benchmark 关心的是：正式计时前这些一次性或偶发性动作是否已经被 warmup/setup 吸收；正式窗口里留下的是 CPU submit、stream 排队、GPU kernel/memcpy/memset activity，还是纯 kernel activity。
+
+用时序图表示，大致是：
+
+```mermaid
+sequenceDiagram
+    participant Host as Host/Python callable
+    participant Runtime as CUDA runtime/library
+    participant Driver as CUDA driver/context
+    participant Stream as CUDA stream queue
+    participant Sched as GPU scheduler
+    participant SM as SM/kernel activity
+    participant Mem as Memory/cache
+
+    rect rgb(245, 245, 245)
+        note over Host,Driver: setup / first-call / warmup phase
+        Host->>Runtime: call op wrapper
+        Runtime->>Runtime: optional JIT/autotune/library handle init
+        Runtime->>Driver: load module / resolve kernel if needed
+        Host->>Runtime: allocate / prepare tensors
+        Runtime->>Mem: allocate device memory / establish mappings
+        Host->>Runtime: warmup launch(es)
+        Runtime->>Driver: submit launch command
+        Driver->>Stream: enqueue kernel work
+        Stream->>Sched: work becomes ready after prior stream deps
+        Sched->>SM: dispatch thread blocks
+        SM->>Mem: instruction/data fetch, L1/L2 fills
+        SM-->>Host: completes after synchronize
+    end
+
+    rect rgb(235, 248, 255)
+        note over Host,SM: steady-state timed iteration
+        Host->>Runtime: _run(i)
+        Runtime->>Driver: package args/grid/block/stream
+        Driver->>Stream: enqueue kernel launch
+        Stream->>Sched: wait for earlier stream work/events
+        Sched->>SM: dispatch blocks to SMs
+        SM->>Mem: execute loads/stores, fill/use cache
+        SM-->>Stream: kernel activity ends
+        Stream-->>Host: visible after synchronize/event/profiler collection
+    end
+```
+
+这张图里的箭头表达的是依赖和归属，不表示每次 launch 都会重新执行所有 setup 动作。比如 module load、JIT/autotune、allocator 扩容和 library handle 初始化通常应被 warmup 吸收；正式计时要么测 CUDA event span，要么测 CUPTI activity，要么测 host wall-time，取决于 benchmark 选择的 start/stop 机制。
 
 Cache 状态也需要单独看。GPU 不需要在启动 kernel 前把业务数据“预装”进 cache，kernel 会在执行时按访存指令自然填充 L1/L2。但 benchmark 需要决定 cache 初始状态是否受控：
 
