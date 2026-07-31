@@ -25,7 +25,7 @@ CUDA kernel launch 对 CPU 是异步的。CPU 发出 launch 后通常很快返�
 
 因此它们更像一组依赖关系，而不是每次 launch 都重复执行的线性步骤。steady-state benchmark 关心的是：正式计时前这些一次性或偶发性动作是否已经被 warmup/setup 吸收；正式窗口里留下的是 CPU submit、stream 排队、GPU kernel/memcpy/memset activity，还是纯 kernel activity。
 
-先只看 **一个 kernel 被调用一次**。下面这张图的时间轴是从上到下；左侧是 CPU/Host 侧发起动作，中间是 CUDA runtime/driver 和 stream queue，右侧是 GPU 执行。图里同时标出了三类 timing marker：
+先只看 **一个 kernel 被调用一次**。下面这张图的时间轴是从左到右；上半部分是 CPU/Host 侧发起和 enqueue，下面是 stream/GPU 执行。图里同时标出了三类 timing marker：
 
 ```text
 CUPTI CPU timestamp：SOL-style attribution window 的 start/end
@@ -36,37 +36,46 @@ CUPTI activity timestamp：kernel 在 GPU 上真正开始/结束执行的 start/
 这是一个对比图：实际 benchmark backend 通常只选择其中一种或两种机制，不一定同时记录 CUDA events 和 CUPTI timestamps。
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant CPU as CPU / Host thread
-    participant RT as CUDA runtime / driver
-    participant Q as CUDA stream queue
-    participant GPU as GPU scheduler / SMs
-    participant CUPTI as CUPTI activity buffer
-
-    rect rgb(235, 248, 255)
-        note over CPU,CUPTI: one steady-state timed call: _run(i)
-        CPU->>CUPTI: CUPTI CPU t0 = cupti.get_timestamp()
-        CPU->>RT: cudaEventRecord(start_event, stream)
-        RT->>Q: enqueue start_event command
-        CPU->>RT: launch kernel<<<grid, block, stream>>>(args)
-        RT->>Q: enqueue kernel command
-        CPU->>RT: cudaEventRecord(end_event, stream)
-        RT->>Q: enqueue end_event command
-        CPU->>RT: synchronize stream/device or wait for event
-
-        Q->>GPU: start_event reaches stream head
-        note over GPU: CUDA event start timestamp
-        Q->>GPU: kernel command becomes ready after prior deps
-        GPU->>CUPTI: CUPTI activity kernel_start
-        GPU->>GPU: execute instructions, loads/stores, L1/L2 activity
-        GPU->>CUPTI: CUPTI activity kernel_end
-        Q->>GPU: end_event reaches stream head
-        note over GPU: CUDA event end timestamp
-
-        RT-->>CPU: synchronize returns
-        CPU->>CUPTI: CUPTI CPU t1 = cupti.get_timestamp()
+flowchart LR
+    subgraph CPU["CPU / Host thread"]
+        T0["CUPTI CPU t0<br/>cupti.get_timestamp()"]
+        EVS_CALL["cudaEventRecord(start_event)"]
+        LAUNCH["launch kernel<br/>kernel&lt;&lt;&lt;grid, block, stream&gt;&gt;&gt;(args)"]
+        EVE_CALL["cudaEventRecord(end_event)"]
+        WAIT["synchronize / wait event"]
+        T1["CUPTI CPU t1<br/>cupti.get_timestamp()"]
     end
+
+    subgraph RT["CUDA runtime / driver"]
+        PACK["package args / grid / block / stream"]
+        SUBMIT["submit commands"]
+    end
+
+    subgraph STREAM["CUDA stream queue"]
+        EVS_Q["start_event command"]
+        K_Q["kernel command"]
+        EVE_Q["end_event command"]
+    end
+
+    subgraph GPU["GPU scheduler / SMs"]
+        EVS_GPU["CUDA event start timestamp"]
+        READY["kernel ready<br/>after prior deps/events"]
+        K_START["CUPTI activity<br/>kernel_start"]
+        EXEC["execute instructions<br/>loads/stores, L1/L2 activity"]
+        K_END["CUPTI activity<br/>kernel_end"]
+        EVE_GPU["CUDA event end timestamp"]
+    end
+
+    T0 --> EVS_CALL --> LAUNCH --> EVE_CALL --> WAIT --> T1
+    EVS_CALL --> SUBMIT
+    LAUNCH --> PACK --> SUBMIT
+    EVE_CALL --> SUBMIT
+    SUBMIT --> EVS_Q --> K_Q --> EVE_Q
+    EVS_Q --> EVS_GPU --> READY
+    K_Q --> READY --> K_START --> EXEC --> K_END
+    EVE_Q --> EVE_GPU
+    K_END --> EVE_GPU
+    EVE_GPU --> WAIT
 ```
 
 读这张图时要注意三点：
