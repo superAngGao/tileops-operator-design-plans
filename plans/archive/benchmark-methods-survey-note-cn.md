@@ -25,48 +25,49 @@ CUDA kernel launch 对 CPU 是异步的。CPU 发出 launch 后通常很快返�
 
 因此它们更像一组依赖关系，而不是每次 launch 都重复执行的线性步骤。steady-state benchmark 关心的是：正式计时前这些一次性或偶发性动作是否已经被 warmup/setup 吸收；正式窗口里留下的是 CPU submit、stream 排队、GPU kernel/memcpy/memset activity，还是纯 kernel activity。
 
-用时序图表示，大致是：
+用时序图表示，大致是下面这个过程：上半部分是 **CPU/Host 侧行为**，下半部分是 **GPU 侧行为**；`CUDA runtime/driver` 和 `stream queue` 是 CPU 提交工作到 GPU 的边界。
 
 ```mermaid
 sequenceDiagram
-    participant Host as Host/Python callable
-    participant Runtime as CUDA runtime/library
-    participant Driver as CUDA driver/context
-    participant Stream as CUDA stream queue
-    participant Sched as GPU scheduler
-    participant SM as SM/kernel activity
-    participant Mem as Memory/cache
+    autonumber
+    participant CPU as CPU / Host thread
+    participant RT as CUDA runtime / driver
+    participant Q as CUDA stream queue
+    participant GPU as GPU scheduler / SMs
+    participant MEM as GPU memory / cache
 
     rect rgb(245, 245, 245)
-        note over Host,Driver: setup / first-call / warmup phase
-        Host->>Runtime: call op wrapper
-        Runtime->>Runtime: optional JIT/autotune/library handle init
-        Runtime->>Driver: load module / resolve kernel if needed
-        Host->>Runtime: allocate / prepare tensors
-        Runtime->>Mem: allocate device memory / establish mappings
-        Host->>Runtime: warmup launch(es)
-        Runtime->>Driver: submit launch command
-        Driver->>Stream: enqueue kernel work
-        Stream->>Sched: work becomes ready after prior stream deps
-        Sched->>SM: dispatch thread blocks
-        SM->>Mem: instruction/data fetch, L1/L2 fills
-        SM-->>Host: completes after synchronize
+        note over CPU,RT: setup / first-call / warmup, usually outside timed window
+        CPU->>RT: call op wrapper
+        RT->>RT: JIT/autotune/module load/library handle init if needed
+        CPU->>RT: allocate or reuse tensors, prepare launch args
+        RT->>MEM: allocate device memory / establish mappings if needed
+        CPU->>RT: warmup launch
+        RT->>Q: enqueue warmup kernel
+        Q->>GPU: release work after earlier stream deps complete
+        GPU->>MEM: execute warmup kernel, fill/use cache
+        GPU-->>CPU: warmup completes after synchronize
     end
 
     rect rgb(235, 248, 255)
-        note over Host,SM: steady-state timed iteration
-        Host->>Runtime: _run(i)
-        Runtime->>Driver: package args/grid/block/stream
-        Driver->>Stream: enqueue kernel launch
-        Stream->>Sched: wait for earlier stream work/events
-        Sched->>SM: dispatch blocks to SMs
-        SM->>Mem: execute loads/stores, fill/use cache
-        SM-->>Stream: kernel activity ends
-        Stream-->>Host: visible after synchronize/event/profiler collection
+        note over CPU,GPU: steady-state timed iteration
+        CPU->>RT: start timing boundary, then _run(i)
+        RT->>Q: package args/grid/block/stream and enqueue launch
+        note over CPU,RT: CPU launch returns before GPU work necessarily finishes
+        Q->>GPU: kernel becomes ready after stream deps/events
+        GPU->>MEM: execute instructions, loads/stores, L1/L2 activity
+        GPU-->>Q: kernel activity ends
+        Q-->>CPU: end visible via synchronize / CUDA event / CUPTI collection
+        CPU->>RT: stop timing boundary or read profiler result
     end
 ```
 
-这张图里的箭头表达的是依赖和归属，不表示每次 launch 都会重新执行所有 setup 动作。比如 module load、JIT/autotune、allocator 扩容和 library handle 初始化通常应被 warmup 吸收；正式计时要么测 CUDA event span，要么测 CUPTI activity，要么测 host wall-time，取决于 benchmark 选择的 start/stop 机制。
+读这张图时可以按两条线看：
+
+- **CPU/Host 线**：调用 Python/C++ wrapper，准备参数，调用 CUDA runtime/driver，把 launch enqueue 到 stream，然后继续执行或在 synchronize/event/profiler 处等待。
+- **GPU 线**：stream 依赖满足后，GPU scheduler 把 blocks 派到 SM；SM 执行指令、访问显存、填充或使用 L1/L2 cache；kernel activity 结束后，结果才对同步或 profiler 可见。
+
+这张图里的箭头表达的是依赖和归属，不表示每次 launch 都会重新执行所有 setup 动作。比如 module load、JIT/autotune、allocator 扩容和 library handle 初始化通常应被 warmup 吸收；正式计时要么测 CPU host wall-time，要么测 CUDA event span，要么测 CUPTI activity，取决于 benchmark 选择的 start/stop 机制。
 
 Cache 状态也需要单独看。GPU 不需要在启动 kernel 前把业务数据“预装”进 cache，kernel 会在执行时按访存指令自然填充 L1/L2。但 benchmark 需要决定 cache 初始状态是否受控：
 
