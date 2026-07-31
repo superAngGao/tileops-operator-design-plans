@@ -59,10 +59,11 @@ flowchart LR
 
     subgraph GPU["GPU scheduler / SMs"]
         EVS_GPU["CUDA event start timestamp"]
-        READY["kernel ready<br/>after prior deps/events"]
+        PRE_GAP["pre-kernel stream gap<br/>dependency check<br/>scheduler handoff<br/>kernel dispatch setup"]
         K_START["CUPTI activity<br/>kernel_start"]
         EXEC["execute instructions<br/>loads/stores, L1/L2 activity"]
         K_END["CUPTI activity<br/>kernel_end"]
+        POST_GAP["post-kernel stream gap<br/>completion bookkeeping<br/>event command scheduling"]
         EVE_GPU["CUDA event end timestamp"]
     end
 
@@ -71,10 +72,9 @@ flowchart LR
     LAUNCH --> PACK --> SUBMIT
     EVE_CALL --> SUBMIT
     SUBMIT --> EVS_Q --> K_Q --> EVE_Q
-    EVS_Q --> EVS_GPU --> READY
-    K_Q --> READY --> K_START --> EXEC --> K_END
-    EVE_Q --> EVE_GPU
-    K_END --> EVE_GPU
+    EVS_Q --> EVS_GPU --> PRE_GAP
+    K_Q --> PRE_GAP --> K_START --> EXEC --> K_END --> POST_GAP
+    EVE_Q --> POST_GAP --> EVE_GPU
     EVE_GPU --> WAIT
 ```
 
@@ -83,6 +83,20 @@ flowchart LR
 - `cudaEventRecord()` 的 CPU 调用只是在 stream 里放一个 event command；真正的 CUDA event timestamp 是 event command 在 GPU stream 上执行时产生的。
 - CUPTI activity 的 `kernel_start/kernel_end` 对应 GPU 上 kernel activity 的真实开始和结束。single-kernel 的 pure kernel time 通常就是 `kernel_end - kernel_start`。
 - SOL-style 的 `cupti.get_timestamp()` 在 CPU 侧取 timestamp，用来形成 attribution window `[t0, t1]`；它本身不是 kernel duration，而是帮助从 CUPTI activity buffer 中挑出属于这次 logical call 的 activity。
+
+CUDA event span 比 CUPTI single-kernel duration 多包了两个 stream gap：
+
+```text
+CUDA event span =
+  pre-kernel stream gap
+  + CUPTI kernel duration
+  + post-kernel stream gap
+
+CUPTI kernel duration =
+  kernel_end - kernel_start
+```
+
+这两个 gap 里通常不是业务计算，而是 stream command 到 kernel dispatch / kernel completion 到 event command 的过渡和 bookkeeping。对于几十或几百微秒的大 kernel，它们占比很小；对于几微秒的 fast kernel，它们会变成可见的偏差和抖动来源。
 
 这张图里的箭头表达的是依赖和归属，不表示每次 launch 都会重新执行所有 setup 动作。比如 module load、JIT/autotune、allocator 扩容和 library handle 初始化通常应被 warmup 吸收；正式计时要么测 CPU host wall-time，要么测 CUDA event span，要么测 CUPTI activity，取决于 benchmark 选择的 start/stop 机制。
 
