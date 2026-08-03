@@ -344,7 +344,18 @@ FlashAttention 仓库中同时存在几类 benchmark 写法：
 
 相关 TileOps 讨论与实现背景：[tile-ai/TileOps#1797](https://github.com/tile-ai/TileOPs/pull/1797)、[tile-ai/TileOps#1796](https://github.com/tile-ai/TileOPs/issues/1796)。
 
-### 8.1 全量 benchmark 对比
+### 8.1 Kineto 与 SOL native 的流程差异
+
+Kineto 路径更快，不是因为它完全不做 discovery，也不是因为 native CUPTI 必须每个 repeat 都重新启动 profiler。两者都可以用一段 collection 覆盖多个 repeats。差别在于两条路径要完成的归因工作不同。
+
+| 路径 | 主要做法 | 省略或增加的工作 |
+| --- | --- | --- |
+| Kineto/#1797-style | 先用小 profiler pass 判断 single-kernel eligibility；正式 timing 时在 projected windows 中聚合 business kernel duration，并除以 captured kernel count | 省掉 per-repeat `start_cpu/end_cpu` attribution window、timestamp slicing、逐 window sequence matching 和 count validation |
+| SOL native sequence attribution | discovery 得到 expected activity sequence；正式 timing 为每个 repeat 记录 CUPTI timestamp window，并在 window 内匹配 expected sequence | 多了 logical-call 级归因和校验，能更直接识别每次 logical call 的真实 activity 结构 |
+
+所以 Kineto 路径主要省下的是 **per-repeat attribution / validation** 的工程成本；代价是依赖 Kineto projection window，而这个 projection 没有公开 ready semaphore，可能导致窗口计数或 kernel 归因不稳定。
+
+### 8.2 全量 benchmark 对比
 
 第一轮全量 benchmark 对比了两条路径：
 
@@ -371,7 +382,7 @@ SOL native 慢约 `325s / 14.8%`。这个成本存在，但没有大到不可接
 
 这批样本中 CUDA event 大多比 CUPTI 更慢：993 条里有 871 条 `cuda_event_latency > cupti_latency`。这符合 CUDA event 的测量口径：它测的是 stream 上 start/end event 之间的 span，会包含 kernel 前后的 stream gap、launch/queue 影响，以及 multi-kernel op 的 operator-level span。
 
-### 8.2 同 case 四路计时对比
+### 8.3 同 case 四路计时对比
 
 为了比较 `SOL native CUPTI`、`Kineto/#1797`、`CUDA event` 和 `CPU wall` 的同 case 差异，补做了一组小规模实验。配置为 `n_warmup=10`、`n_repeat=50`、`n_trials=3`，使用官方 runner 环境的本地实验镜像，只增加 Python CUPTI binding，不升级 `torch` / `tilelang`。
 

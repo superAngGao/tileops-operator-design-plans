@@ -153,7 +153,7 @@ Python benchmark closure
 - 可以直接嵌入现有 pytest benchmark；
 - 不需要维护 native CUPTI buffer callback / flush / finalize 逻辑；
 - 可以通过 `record_function` 给每个 repeat 建立看似自然的窗口；
-- 更快：本质上不是 Kineto “不需要 discovery”，也不是 native CUPTI 每个 repeat 都重新启动 profiler；两者都可以用一段 collection 覆盖多个 repeats。#697/#1797-style 路径把问题收窄成 single-kernel eligibility 和 aggregate kernel-duration 统计：先用一次很小的 classification/profiler pass 判断是否 single-kernel，正式 timing 时再对 trial 内落入 projected windows 的 business kernels 求总 duration，并除以 captured kernel count。SOL native sequence attribution 为了支持 logical-call 级归因，需要 discovery 出 expected activity sequence，并在正式 timing 里为每个 repeat 记录 `start_cpu/end_cpu`、切 timestamp window、逐 window 做 sequence matching 和 count validation；这些 per-repeat attribution / validation 工作才是 Kineto 路径主要省掉的时间。
+- 更快：Kineto 路径主要省掉了 SOL native 里的 per-repeat attribution / validation 工作，包括 timestamp window slicing、sequence matching 和 count validation；详细对比见 [调研笔记 §8.1](archive/benchmark-methods-survey-note-cn.md#81-kineto-与-sol-native-的流程差异)。
 - 绕过 `key_averages()` 后，raw Kineto event iteration 解析开销显著下降。
 
 相关记录：
