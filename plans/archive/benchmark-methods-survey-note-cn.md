@@ -172,14 +172,26 @@ MEMCPY
 MEMSET
 ```
 
+SOL 论文 §4.4 描述的 evaluation protocol 使用 CUDA events：10 次 warmup、50 次 timed iterations、3 trials；每个 timed iteration 前通过 zero 一个 256 MB device buffer 清 L2 cache，并 clone tensor arguments，让每轮从 fresh inputs / new addresses 开始。当前 SOL-ExecBench main 分支实现已经默认走 CUPTI timing，但仍保留同样的 cache-control 思路：每次 warmup、discovery、timed iteration 的 user runner 之前，先 reset persisting L2，再 zero 一个约 `2 * L2_cache_size` 的 device buffer 来冲刷 L2。这里没有声称显式清 L1。
+
 SOL 的关键流程是：
 
 ```text
 1. warmup
+     setup fresh args
+     reset persisting L2
+     clear L2 buffer
+     run
 2. discovery iteration:
+     setup fresh args
+     reset persisting L2
+     clear L2 buffer
      collect native CUPTI activity
      derive expected activity sequence
 3. timed iterations:
+     setup fresh args
+     reset persisting L2
+     clear L2 buffer
      start_cpu = cupti.get_timestamp()
      runner(args)
      torch.cuda.synchronize()
@@ -195,6 +207,9 @@ SOL 的关键流程是：
 ```mermaid
 flowchart TB
     subgraph CPU["CPU"]
+        P0["setup fresh args<br/>shift input/output addresses"]:::work
+        C0["reset persisting L2<br/>cudaCtxResetPersistingL2Cache"]:::work
+        C1["clear L2 buffer<br/>zero large device buffer"]:::work
         S0["start_cpu<br/>cuptiGetTimestamp()"]:::cupti
         R0["runner(args)<br/>Python / PyTorch dispatch"]:::work
         L0["cudaLaunchKernel(...)<br/>kernel command enqueued"]:::work
@@ -204,6 +219,7 @@ flowchart TB
     end
 
     subgraph GPU["GPU"]
+        CL0["L2 clear activity<br/>zero benchmark buffer"]:::work
         K0["CUPTI kernel 1 start"]:::cupti
         X0["kernel 1 execution"]:::work
         K1["CUPTI kernel 1 end"]:::cupti
@@ -213,7 +229,8 @@ flowchart TB
         D0["all related GPU work complete"]:::work
     end
 
-    S0 --> R0 --> L0 --> L1 --> SY0 --> S1
+    P0 --> C0 --> C1 --> S0 --> R0 --> L0 --> L1 --> SY0 --> S1
+    C1 -. queued work .-> CL0 --> K0
     L0 -. queued work .-> K0 --> X0 --> K1 --> K2 --> X1 --> K3 --> D0
     L1 -. queued work .-> K2
     D0 -. unblocks .-> SY0
@@ -224,7 +241,9 @@ flowchart TB
     classDef work fill:#F3F4F6,stroke:#6B7280,color:#111827
 ```
 
-因此 SOL 的 `start_cpu/end_cpu` 更像“归因边界”，不是最终的 GPU latency 本身。只要 CUPTI activity 里的 kernel / memcpy / memset 完整落在这个边界内，SOL 就可以用 activity 的 `min(start)` 到 `max(end)` 得到一次 logical call 的 GPU span。
+因此 SOL 的 `start_cpu/end_cpu` 更像“归因边界”，不是最终的 GPU latency 本身。CUPTI 路径里 timed iteration 的 cache clear 后没有额外 synchronize，所以 clear-buffer activity 可能出现在 `[start_cpu, end_cpu]` window 内；SOL 依赖 discovery sequence 只选择 user runner 对应的 kernel / memcpy / memset，把 cache-management activity 排除出 latency。CUDA event 路径则把 `start_event.record()` 放在 cache clear 之后，因此 event elapsed time 也不包含 cache clear 本身。
+
+如果不清 L2，重复 benchmark 同一输入或相邻地址时，上一轮留下的数据可能被下一轮复用，memory-bound 或 small working-set kernel 会测到偏 warm-cache 的 latency；不同实现也可能因为 cache residency 差异而不公平。清 L2 和 fresh addresses 的目的不是模拟所有生产场景，而是固定 benchmark 的 cache 口径，减少跨 iteration 状态泄漏。
 
 SOL 的特点是用 discovery sequence 做归因，并用 activity span 表示一次 logical call 的 GPU 侧 latency。对于 single-kernel call，span 退化为 kernel duration；对于 multi-kernel call，它比简单相加 kernel duration 更接近 operator GPU span。
 
@@ -323,6 +342,7 @@ FlashAttention 仓库中同时存在几类 benchmark 写法：
 
 - NVIDIA SOL-ExecBench timing implementation: https://github.com/NVIDIA/SOL-ExecBench/blob/main/src/sol_execbench/core/bench/timing.py
 - NVIDIA SOL-ExecBench CUPTI utilities: https://github.com/NVIDIA/SOL-ExecBench/blob/main/src/sol_execbench/core/bench/cupti_utils.py
+- NVIDIA SOL-ExecBench paper: https://arxiv.org/html/2603.19173v1
 - PyTorch `torch.utils.benchmark.Timer`: https://github.com/pytorch/pytorch/blob/main/torch/utils/benchmark/utils/timer.py
 - PyTorch benchmark README: https://github.com/pytorch/pytorch/blob/main/torch/utils/benchmark/README.md
 - Triton `triton.testing.do_bench`: https://github.com/triton-lang/triton/blob/main/python/triton/testing.py
