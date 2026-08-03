@@ -8,7 +8,7 @@ TileOps 最初希望 benchmark 基础设施对齐 NVIDIA SOL-ExecBench：固定 
 
 重新核对 NV SOL 代码后，需要纠正一个历史混淆：NV SOL 当前默认 timing methodology 是 **native CUPTI activity timing**。当前 TileOps 的主要问题集中在 Kineto projection 依赖：当 projected annotation window 数不是 `n_repeat` 时，benchmark fallback 到 CUDA events。CUDA events 对 fast kernels 会带入 launch overhead，使 nightly latency 和 roofline 数据不可直接与 CUPTI kernel-only history 混合比较。
 
-本轮实验进一步确认：我们不仅比较了两条路径的总耗时，也逐项比较了两种方法产出的 benchmark latency。当两条路径都测到 single-kernel CUPTI activity 时，Kineto 和 SOL native 的 latency 基本吻合；第一轮全量 benchmark 中，这类 matched record 共 1317 条，median absolute difference 约 0.32%，p90 约 1.11%。主要差异来自 Kineto 大量 fallback 到 CUDA events。Kineto/#1797-style 路径耗时 2195s，SOL native 路径耗时 2520s，SOL native 慢约 325s / 14.8%。这个成本存在，但没有大到不可接受。
+本轮实验进一步确认：当两条路径都测到 single-kernel CUPTI activity 时，Kineto 和 SOL native 的 latency 基本吻合；主要差异来自 Kineto 大量 fallback 到 CUDA events。全量 benchmark 与同 case 四路计时对比数据见 [GPU benchmark 方法调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-四路计时实验事实)。
 
 当前决策是：**以 SOL native CUPTI 作为 TileOps benchmark 主路径；使用 native CUPTI discovery 识别 kernel name/count；single-kernel op 使用 CUPTI kernel duration；multi-kernel op 先保守 fallback 到 CUDA events**。这样避免继续依赖 Kineto projection，同时避免把 multi-kernel duration sum 误当成 operator latency。
 
@@ -155,6 +155,7 @@ Python benchmark closure
 - 可以直接嵌入现有 pytest benchmark；
 - 不需要维护 native CUPTI buffer callback / flush / finalize 逻辑；
 - 可以通过 `record_function` 给每个 repeat 建立看似自然的窗口；
+- 更快：本质上不是 Kineto “不需要 discovery”，也不是 native CUPTI 每个 repeat 都重新启动 profiler；两者都可以用一段 collection 覆盖多个 repeats。#697/#1797-style 路径把问题收窄成 single-kernel eligibility 和 aggregate kernel-duration 统计：先用一次很小的 classification/profiler pass 判断是否 single-kernel，正式 timing 时再对 trial 内落入 projected windows 的 business kernels 求总 duration，并除以 captured kernel count。SOL native sequence attribution 为了支持 logical-call 级归因，需要 discovery 出 expected activity sequence，并在正式 timing 里为每个 repeat 记录 `start_cpu/end_cpu`、切 timestamp window、逐 window 做 sequence matching 和 count validation；这些 per-repeat attribution / validation 工作才是 Kineto 路径主要省掉的时间。
 - 绕过 `key_averages()` 后，raw Kineto event iteration 解析开销显著下降。
 
 相关记录：
@@ -354,7 +355,7 @@ sampled_call_count
 | B. single-kernel Kineto + multi-kernel CUDA event | Kineto/CUPTI kernel duration | CUDA event operator latency | **更快**；改动较小；延续现有 TileOps profiler infrastructure | 仍依赖 Kineto projection/window；如果 multi-kernel 判定也依赖 Kineto，可能把真实 multi-kernel 误判成 single-kernel |
 | C. single-kernel SOL native + multi-kernel CUDA event | native CUPTI kernel duration | CUDA event operator latency | 绕开 Kineto projection；保留 fast single-kernel pure kernel time；避免 multi-kernel duration sum 误当 op latency | 比 Kineto 路径慢一些；需要维护 native CUPTI binding 和 discovery 逻辑 |
 
-第一轮全量 benchmark 对比中，方案 B 的实验近似路径 Kineto/#1797-style 为 2195s，方案 C 的核心 SOL native 路径为 2520s，SOL native 慢约 325s / 14.8%。因此方案 B 的速度优势是明确存在的。
+调研实验显示，方案 B 的速度优势是明确存在的，但方案 C 的额外成本没有大到不可接受；同时 single-kernel 的 Kineto/CUPTI 与 SOL native CUPTI latency 基本吻合。具体数据见 [调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-四路计时实验事实)。
 
 但方案 B 的根本风险也仍然存在：如果 single/multi-kernel 判定来自 Kineto projected window，它可能漏看 activity。第一轮中 `torch-sdpa` backward 就出现了 Kineto 侧 `activity_count=150`、SOL native 侧 `activity_count=600` 的差异，说明 Kineto window 内看到的 kernel names/counts 不一定等于 op 的真实 dispatch 结构。
 
@@ -373,14 +374,20 @@ sampled_call_count
      显式 fallback 或失败，并记录 diagnostics
 ```
 
-这样保留了 SOL native 对真实 CUPTI activity 的直接访问，绕开 Kineto annotation projection；同时避免把 multi-kernel 的 duration sum 误当成 op latency。
+这样保留了 SOL native 对真实 CUPTI activity 的直接访问，绕开 Kineto annotation projection；同时避免把 multi-kernel 的 duration sum 误当成 op latency。该决策采用方案 C：**single-kernel SOL native + multi-kernel CUDA event**。
 
 相关探索：
 
 - [tile-ai/TileOPs#1797](https://github.com/tile-ai/TileOPs/pull/1797)
 - [tile-ai/TileOPs#1796](https://github.com/tile-ai/TileOPs/issues/1796)
+- [GPU benchmark 方法调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-四路计时实验事实)
 
-第一轮全量对比中，Kineto/#1797-style 路径为 2195s，SOL native 路径为 2520s，SOL native 慢约 325s / 14.8%。两边都成功测到 single-kernel CUPTI 的 1317 条记录中，median absolute difference 约 0.32%，p90 约 1.11%。这说明 single-kernel CUPTI 口径基本一致；主要差异来自 Kineto fallback 到 CUDA events。
+调研数据支持这个选择：
+
+- single-kernel 时，SOL native CUPTI 与 Kineto/CUPTI 的 latency 基本一致；
+- fast single-kernel 如果 fallback 到 CUDA event / CPU wall，会被固定开销显著放大；
+- multi-kernel 时，kernel duration sum 与 operator latency 不是同一口径，CUDA event / CPU wall 更接近 operator span；
+- SOL native 比 Kineto 路径慢一些，但全量成本差异在可接受范围内。
 
 ### 5.4 中期：实现 TileOps native CUPTI backend
 

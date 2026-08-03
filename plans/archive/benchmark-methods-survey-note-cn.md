@@ -1,6 +1,6 @@
 # GPU Benchmark 方法调研笔记：NV SOL / PyTorch / Triton / FA3
 
-更新日期：2026-07-31
+更新日期：2026-08-03
 
 这份笔记是 TileOps benchmark timing 讨论中的背景材料，不是最终决策文档。它整理 GPU kernel 连续调度、初始化与计时边界，以及 NV SOL、PyTorch、Triton、FlashAttention / FA3 等常见 benchmark 方法的差异。
 
@@ -338,7 +338,65 @@ FlashAttention 仓库中同时存在几类 benchmark 写法：
 
 这类算子库 benchmark 的核心目标通常是 operator-level latency 和 throughput comparison，而不是 nightly history 中严格的 kernel-only attribution。它们适合比较 FA2/FA3/FlashInfer/cuDNN/PyTorch 等实现的端到端 op 延迟。
 
-## 8. 参考资料
+## 8. TileOps 四路计时实验事实
+
+本节记录 TileOps timing 路径选择过程中做过的本地实验事实，只作为方法调研和技术决策的依据，不在这里给出最终 policy。
+
+相关 TileOps 讨论与实现背景：[tile-ai/TileOps#1797](https://github.com/tile-ai/TileOPs/pull/1797)、[tile-ai/TileOps#1796](https://github.com/tile-ai/TileOPs/issues/1796)。
+
+### 8.1 全量 benchmark 对比
+
+第一轮全量 benchmark 对比了两条路径：
+
+| 路径 | 总耗时 | 说明 |
+| --- | ---: | --- |
+| Kineto/#1797-style | 2195s | single-kernel 尽量走 Kineto/CUPTI；异常或 multi-kernel fallback 到 CUDA event |
+| SOL native | 2520s | native CUPTI discovery / attribution 路径 |
+
+SOL native 慢约 `325s / 14.8%`。这个成本存在，但没有大到不可接受。
+
+当两条路径都测到 single-kernel CUPTI activity 时，latency 基本一致：
+
+| 对比集合 | 记录数 | median abs relative diff | p90 abs relative diff | p99 abs relative diff | max abs relative diff |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Kineto CUPTI vs SOL native CUPTI, single-kernel matched records | 1317 | 0.319% | 1.109% | 3.336% | 17.696% |
+
+`17.696%` 的最大相对差来自一个极小 kernel：`SSDStatePassingFwdOp` / `mamba` / `b1-c2-h4-d32-fp16`。Kineto 测到 `0.00269056 ms`，SOL native 测到 `0.00228602 ms`，绝对差约 `0.00040454 ms`，也就是 `0.405 us`。因为 denominator 只有约 `2.3 us`，相对差被放大。同一批 1317 条记录中，超过 `10%` 的相对差只有 2 条。
+
+相应地，当 Kineto fallback 到 CUDA event，而 SOL native CUPTI 成功时，latency 口径明显改变：
+
+| 对比集合 | 记录数 | median abs diff | p90 abs diff | median abs relative diff | p90 abs relative diff | p99 abs relative diff |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Kineto fallback CUDA event vs SOL native CUPTI activity/span | 993 | 44.722 us | 211.063 us | 19.700% | 169.138% | 562.692% |
+
+这批样本中 CUDA event 大多比 CUPTI 更慢：993 条里有 871 条 `cuda_event_latency > cupti_latency`。这符合 CUDA event 的测量口径：它测的是 stream 上 start/end event 之间的 span，会包含 kernel 前后的 stream gap、launch/queue 影响，以及 multi-kernel op 的 operator-level span。
+
+### 8.2 同 case 四路计时对比
+
+为了比较 `SOL native CUPTI`、`Kineto/#1797`、`CUDA event` 和 `CPU wall` 的同 case 差异，补做了一组小规模实验。配置为 `n_warmup=10`、`n_repeat=50`、`n_trials=3`，使用官方 runner 环境的本地实验镜像，只增加 Python CUPTI binding，不升级 `torch` / `tilelang`。
+
+single-kernel 范围选择 GEMM 小、中、大三档：
+
+| case | SOL native CUPTI | Kineto/#1797 | CUDA event | CPU wall |
+| --- | ---: | ---: | ---: | ---: |
+| small single-kernel GEMM | 0.004858 ms | 0.004846 ms, -0.24% | 0.027452 ms, +465% | 0.029869 ms, +515% |
+| medium single-kernel GEMM | 0.100944 ms | 0.100850 ms, -0.09% | 0.119418 ms, +18.3% | 0.127450 ms, +26.3% |
+| large single-kernel GEMM | 1.958222 ms | 1.963246 ms, +0.26% | 1.993260 ms, +1.79% | 2.000512 ms, +2.16% |
+
+这组数据说明：single-kernel 下，SOL native 和 Kineto/CUPTI 测到的是同一种 kernel activity 口径；CUDA event 和 CPU wall 在小 kernel 上会被固定 gap / launch / synchronize overhead 放大。
+
+multi-kernel 范围选择较大的 GQA split 和 GDN forward。下表里的 `SOL native CUPTI` 是捕到的 business kernel duration aggregate / call，用来和 operator span 口径对照；它不应直接作为推荐的 multi-kernel op latency。
+
+| case | SOL native CUPTI | Kineto/#1797 | CUDA event | CPU wall |
+| --- | ---: | ---: | ---: | ---: |
+| GQA split 256k | 0.138000 ms, `300/150` kernels | fallback: 0.190268 ms | 0.184812 ms | 0.193686 ms |
+| GDN forward 32k | 1.308143 ms, `900/150` kernels | fallback: 1.373955 ms | 1.365596 ms | 1.353642 ms |
+
+这里的 `300/150` 表示 150 次 logical calls 捕到 300 个 business kernels，也就是每 call 2 个 kernel；`900/150` 表示每 call 6 个 kernel。Kineto/#1797 按预期识别为 multi-kernel 并 fallback 到 CUDA event。
+
+multi-kernel 下，SOL native 的 CUPTI 数字如果按 kernel duration sum 使用，并不等于 operator latency。CUDA event / CPU wall 更接近 operator span。GDN forward 这类较大的 multi-kernel op 中，二者差距只有几个百分点；GQA split 仍然较短，event span 中固定 gap 占比仍然明显。
+
+## 9. 参考资料
 
 - NVIDIA SOL-ExecBench timing implementation: https://github.com/NVIDIA/SOL-ExecBench/blob/main/src/sol_execbench/core/bench/timing.py
 - NVIDIA SOL-ExecBench CUPTI utilities: https://github.com/NVIDIA/SOL-ExecBench/blob/main/src/sol_execbench/core/bench/cupti_utils.py
