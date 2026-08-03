@@ -1,6 +1,6 @@
 # TileOps Benchmark Timing 技术报告：NV SOL 对齐与改进路线
 
-更新日期：2026-07-31
+更新日期：2026-08-03
 
 ## 摘要
 
@@ -8,7 +8,7 @@ TileOps 最初希望 benchmark 基础设施对齐 NVIDIA SOL-ExecBench：固定 
 
 重新核对 NV SOL 代码后，需要纠正一个历史混淆：NV SOL 当前默认 timing methodology 是 **native CUPTI activity timing**。当前 TileOps 的主要问题集中在 Kineto projection 依赖：当 projected annotation window 数不是 `n_repeat` 时，benchmark fallback 到 CUDA events。CUDA events 对 fast kernels 会带入 launch overhead，使 nightly latency 和 roofline 数据不可直接与 CUPTI kernel-only history 混合比较。
 
-本轮实验进一步确认：当两条路径都测到 single-kernel CUPTI activity 时，Kineto 和 SOL native 的 latency 基本一致；主要差异来自 Kineto 大量 fallback 到 CUDA events。第一轮全量 benchmark 中，Kineto/#1797-style 路径耗时 2195s，SOL native 路径耗时 2520s，SOL native 慢约 325s / 14.8%。这个成本存在，但没有大到不可接受。
+本轮实验进一步确认：我们不仅比较了两条路径的总耗时，也逐项比较了两种方法产出的 benchmark latency。当两条路径都测到 single-kernel CUPTI activity 时，Kineto 和 SOL native 的 latency 基本吻合；第一轮全量 benchmark 中，这类 matched record 共 1317 条，median absolute difference 约 0.32%，p90 约 1.11%。主要差异来自 Kineto 大量 fallback 到 CUDA events。Kineto/#1797-style 路径耗时 2195s，SOL native 路径耗时 2520s，SOL native 慢约 325s / 14.8%。这个成本存在，但没有大到不可接受。
 
 当前决策是：**以 SOL native CUPTI 作为 TileOps benchmark 主路径；使用 native CUPTI discovery 识别 kernel name/count；single-kernel op 使用 CUPTI kernel duration；multi-kernel op 先保守 fallback 到 CUDA events**。这样避免继续依赖 Kineto projection，同时避免把 multi-kernel duration sum 误当成 operator latency。
 
