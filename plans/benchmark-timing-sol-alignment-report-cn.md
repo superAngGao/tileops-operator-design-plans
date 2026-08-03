@@ -137,8 +137,6 @@ torch.profiler.profile(activities=[CUDA])
   -> sum CUDA kernel duration
 ```
 
-#689 / #692 的文本中曾把 SOL timing 写成 CUDA events，并把 TileOps 的 CUPTI kernel-only time 描述为 “improvement over SOL”。这是当时文档中的历史表述；重新核对 NV SOL 当前代码后，不能再把这句话当成 NV SOL 真实实现的描述。
-
 ### 2.2 为什么使用 Kineto
 
 当时使用 Kineto 的主要考虑是低成本集成：
