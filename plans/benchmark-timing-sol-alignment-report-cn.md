@@ -8,9 +8,9 @@ TileOps 最初希望 benchmark 基础设施对齐 NVIDIA SOL-ExecBench：固定 
 
 重新核对 NV SOL 代码后，需要纠正一个历史混淆：NV SOL 当前默认 timing methodology 是 **native CUPTI activity timing**。当前 TileOps 的主要问题集中在 Kineto projection 依赖：当 projected annotation window 数不是 `n_repeat` 时，benchmark fallback 到 CUDA events。CUDA events 对 fast kernels 会带入 launch overhead，使 nightly latency 和 roofline 数据不可直接与 CUPTI kernel-only history 混合比较。
 
-本轮实验进一步确认：当两条路径都测到 single-kernel CUPTI activity 时，Kineto 和 SOL native 的 latency 基本吻合；主要差异来自 Kineto 大量 fallback 到 CUDA events。全量 benchmark 与同 case 四路计时对比数据见 [GPU benchmark 方法调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-四路计时实验事实)。
+本轮实验进一步确认：当两条路径都测到 single-kernel CUPTI activity 时，Kineto 和 SOL native 的 latency 基本吻合；主要差异来自 Kineto 大量 fallback 到 CUDA events。全量 benchmark 与同 case 四路计时对比数据见 [GPU benchmark 方法调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-计时路径实验事实)。
 
-当前决策是：**以 SOL native CUPTI 作为 TileOps benchmark 主路径；使用 native CUPTI discovery 识别 kernel name/count；single-kernel op 使用 CUPTI kernel duration；multi-kernel op 先保守 fallback 到 CUDA events**。这样避免继续依赖 Kineto projection，同时避免把 multi-kernel duration sum 误当成 operator latency。
+当前决策是：**以 SOL native CUPTI 作为 TileOps benchmark 主路径；使用 native CUPTI discovery 识别 activity identity / kernel name / count；single-kernel op 使用 CUPTI kernel duration；multi-kernel op 先保守 fallback 到 CUDA events**。这样避免继续依赖 Kineto projection，同时避免把 multi-kernel duration sum 误当成 operator latency。
 
 ## 1. NV SOL 的具体流程
 
@@ -273,7 +273,7 @@ Kineto 的 CUPTI timing 原理和 NV SOL native CUPTI 并不矛盾：二者正�
 CPU annotation -> projected GPU window -> count regions
 ```
 
-这个 projection 路径没有公开 ready semaphore 或细粒度诊断接口。我们用 Kineto trace 和 native CUPTI probe 做了 targeted 对照：在 Kineto partial trace 中，缺失 repeat 的 CPU annotation、CUDA launch API 和 CUDA event elapsed time 都存在，但 Kineto result 中没有对应 correlation id 的 GPU business kernel activity；另一次 native CUPTI probe 在同一 case 上可以用 CPU timestamp window 和 external correlation id 把前几轮 GPU kernel activity 正常归属到对应 repeat。这个对照不支持“GPU activity 整体后移几轮”的解释，更支持问题出在 Kineto profiler/projection 路径的 session 头部 activity 覆盖或归因上。具体实验见 [调研笔记 §8.4](archive/benchmark-methods-survey-note-cn.md#84-kineto-projection-不稳定性定位实验)。
+这个 projection 路径没有公开 ready semaphore 或细粒度诊断接口。我们用 Kineto trace 和 native CUPTI probe 做了 targeted 对照：在 Kineto partial trace 中，缺失 repeat 的 CPU annotation、CUDA launch API 和 CUDA event elapsed time 都存在，但 Kineto result 中没有对应 correlation id 的 GPU business kernel activity；另一次 native CUPTI probe 在同一 case 上可以用 CPU timestamp window 和 external correlation id 把前几轮 GPU kernel activity 正常归属到对应 repeat。这个对照不支持“GPU activity 整体后移几轮”的解释，倾向支持问题与 Kineto profiler/projection 路径的 session 头部 activity 覆盖或归因有关。具体实验见 [调研笔记 §8.4](archive/benchmark-methods-survey-note-cn.md#84-kineto-projection-不稳定性定位实验)。
 
 因此，当前故障链路是：
 
@@ -330,7 +330,7 @@ unknown backend latency
 
 NCU / NVTX runner 仍然适合作为 diagnostic backend 或 review artifact，用于疑难 case cross-check；但它不是当前 nightly production timing 的自然主路径。
 
-调研实验显示，方案 B 的速度优势是明确存在的，但方案 C 的额外成本没有大到不可接受；同时 single-kernel 的 Kineto/CUPTI 与 SOL native CUPTI latency 基本吻合。具体数据见 [调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-四路计时实验事实)。
+调研实验显示，方案 B 的速度优势是明确存在的，但方案 C 的额外成本没有大到不可接受；同时 single-kernel 的 Kineto/CUPTI 与 SOL native CUPTI latency 基本吻合。具体数据见 [调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-计时路径实验事实)。
 
 方案 B 的主要风险仍然存在：它继续依赖 Kineto projection，而 targeted probe 显示这条路径会出现 session 头部 partial trace。第一轮中 `torch-sdpa` backward 也出现了 Kineto 侧 `activity_count=150`、SOL native 侧 `activity_count=600` 的差异，说明 Kineto window 内看到的 kernel names/counts 不一定等于 op 的完整 dispatch 结构。
 
@@ -368,7 +368,7 @@ profile(fn, args):
 
 - [tile-ai/TileOps#1797](https://github.com/tile-ai/TileOPs/pull/1797)
 - [tile-ai/TileOps#1796](https://github.com/tile-ai/TileOPs/issues/1796)
-- [GPU benchmark 方法调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-四路计时实验事实)
+- [GPU benchmark 方法调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-计时路径实验事实)
 
 这个选择的依据是：
 

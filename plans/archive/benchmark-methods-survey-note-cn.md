@@ -1,8 +1,8 @@
-# GPU Benchmark 方法调研笔记：NV SOL / PyTorch / Triton / FA3
+# GPU Benchmark 方法与 TileOps 计时实验调研笔记
 
 更新日期：2026-08-03
 
-这份笔记是 TileOps benchmark timing 讨论中的背景材料，不是最终决策文档。它整理 GPU kernel 连续调度、初始化与计时边界，以及 NV SOL、PyTorch、Triton、FlashAttention / FA3 等常见 benchmark 方法的差异。
+这份笔记是 TileOps benchmark timing 讨论中的背景材料和实验归档，不是最终决策文档。它包含两部分内容：一是整理 GPU kernel 连续调度、初始化与计时边界，以及 NV SOL、PyTorch、Triton、FlashAttention / FA3 等常见 benchmark 方法的差异；二是记录 TileOps 本轮对 Kineto、SOL native CUPTI、CUDA event 和 CPU wall 等计时路径的本地实验结果。
 
 ## 1. GPU kernel 调度与计时基础
 
@@ -31,7 +31,7 @@ CUDA kernel launch 对 CPU 是异步的。CPU 发出 launch 后通常很快返�
 CUPTI Runtime/Driver API activity：每个 CUDA API 调用自己的 host-side start/end
 SOL-style cupti.get_timestamp()：CPU 侧手动取 timestamp，形成 activity attribution window
 CUDA event timestamp：event record 在 stream 上执行时产生的 start/end
-CUPTI activity timestamp：kernel 在 GPU 上真正开始/结束执行的 start/end
+CUPTI activity timestamp：kernel/memcpy/memset 等 GPU activity 的 start/end
 ```
 
 图中的颜色在全文保持一致：
@@ -94,7 +94,7 @@ flowchart TB
 - CUPTI kernel activity 的 `kernel_start/kernel_end` 对应 GPU 上 kernel activity 的开始和结束。single-kernel 的 pure kernel time 通常就是 `kernel_end - kernel_start`。
 - SOL-style 的 `cupti.get_timestamp()` 在 CPU 侧取 timestamp，用来形成 attribution window `[t0, t1]`；它本身不是 kernel duration，而是帮助从 CUPTI activity buffer 中挑出属于这次 logical call 的 activity。
 
-CUDA event span 比 CUPTI single-kernel duration 多包了两个 stream gap：
+对于一个 single-kernel callable，CUDA event span 比 CUPTI single-kernel duration 多包了两个 stream gap：
 
 ```text
 CUDA event span =
@@ -156,15 +156,15 @@ cache / persisting L2 状态准备
 | --- | --- | --- | --- | --- |
 | CPU wall timer | CPU `timer()` 前后包住 callable，通常前后同步 | host 视角 wall-time | 简单，适合 end-to-end | 包含 launch、Python/runtime、sync overhead |
 | CUDA events | 在 stream 中 enqueue start/end event | GPU stream span | 低成本，适合 operator wall latency | 对 fast single-kernel 会受 launch/queue 行为和多 kernel gap 影响 |
-| CUPTI activity | CUPTI 记录 kernel/memcpy/memset start/end | GPU activity duration/span | 可以得到 kernel-only 或 activity sequence | 需要可靠 attribution 和 buffer 管理 |
+| CUPTI activity | CUPTI 记录 kernel/memcpy/memset start/end | GPU activity duration/span | 可以得到 kernel-only 或 activity sequence | 需要可靠 attribution、activity selection 和 buffer 管理 |
 | PyTorch/Kineto profiler | Kineto 收集 CUPTI activity，并可投影 CPU annotation | profiler event timeline | 接入简单，能从 Python 使用 | annotation projection 没有公开 ready semaphore |
 | NCU/Nsight | 外部 profiler 采集 kernel/profile metric | profiler report | 诊断能力强 | 启动成本高，不适合默认 nightly 全量路径 |
 
-这里的关键不是“哪个时间更真实”，而是 benchmark history 必须保持同一口径。
+这里的关键不是“哪个时间更正确”，而是 benchmark history 必须保持同一口径。
 
 ## 4. NV SOL
 
-NV SOL 的默认 timing backend 是 native CUPTI activity timing。它使用 Python CUPTI binding 开启 GPU activity collection，主要采集：
+NV SOL 当前 main 分支的默认 timing backend 是 native CUPTI activity timing。它使用 Python CUPTI binding 开启 GPU activity collection，timing 路径主要采集：
 
 ```text
 CONCURRENT_KERNEL
@@ -174,7 +174,7 @@ MEMSET
 
 SOL 论文 §4.4 描述的 evaluation protocol 使用 CUDA events：10 次 warmup、50 次 timed iterations、3 trials；每个 timed iteration 前通过 zero 一个 256 MB device buffer 清 L2 cache，并 clone tensor arguments，让每轮从 fresh inputs / new addresses 开始。当前 SOL-ExecBench main 分支实现已经默认走 CUPTI timing，但仍保留同样的 cache-control 思路：每次 warmup、discovery、timed iteration 的 user runner 之前，先 reset persisting L2，再 zero 一个约 `2 * L2_cache_size` 的 device buffer 来冲刷 L2。这里没有声称显式清 L1。
 
-SOL 的关键流程是：
+SOL 当前 main 分支 CUPTI timing 的关键流程是：
 
 ```text
 1. warmup
@@ -187,7 +187,7 @@ SOL 的关键流程是：
      reset persisting L2
      clear L2 buffer
      collect native CUPTI activity
-     derive expected activity sequence
+     derive expected activity identity sequence/counts
 3. timed iterations:
      setup fresh args
      reset persisting L2
@@ -197,8 +197,8 @@ SOL 的关键流程是：
      torch.cuda.synchronize()
      end_cpu = cupti.get_timestamp()
 4. attribution:
-     select expected sequence inside timestamp window
-     validate activity counts
+     select expected activity sequence inside timestamp window
+     validate activity identity counts
      latency = max(activity.end) - min(activity.start)
 ```
 
@@ -241,11 +241,11 @@ flowchart TB
     classDef work fill:#F3F4F6,stroke:#6B7280,color:#111827
 ```
 
-因此 SOL 的 `start_cpu/end_cpu` 更像“归因边界”，不是最终的 GPU latency 本身。CUPTI 路径里 timed iteration 的 cache clear 后没有额外 synchronize，所以 clear-buffer activity 可能出现在 `[start_cpu, end_cpu]` window 内；SOL 依赖 discovery sequence 只选择 user runner 对应的 kernel / memcpy / memset，把 cache-management activity 排除出 latency。CUDA event 路径则把 `start_event.record()` 放在 cache clear 之后，因此 event elapsed time 也不包含 cache clear 本身。
+因此 SOL 的 `start_cpu/end_cpu` 更像“归因边界”，不是最终的 GPU latency 本身。CUPTI 路径里 timed iteration 的 cache clear 后没有额外 synchronize，所以 clear-buffer activity 可能出现在 `[start_cpu, end_cpu]` window 内；SOL 依赖 discovery 得到的 activity identity sequence 只选择 user runner 对应的 kernel / memcpy / memset，把 cache-management activity 排除出 latency。CUDA event 路径则把 `start_event.record()` 放在 cache clear 之后，因此 event elapsed time 也不包含 cache clear 本身。
 
 如果不清 L2，重复 benchmark 同一输入或相邻地址时，上一轮留下的数据可能被下一轮复用，memory-bound 或 small working-set kernel 会测到偏 warm-cache 的 latency；不同实现也可能因为 cache residency 差异而不公平。清 L2 和 fresh addresses 的目的不是模拟所有生产场景，而是固定 benchmark 的 cache 口径，减少跨 iteration 状态泄漏。
 
-SOL 的特点是用 discovery sequence 做归因，并用 activity span 表示一次 logical call 的 GPU 侧 latency。对于 single-kernel call，span 退化为 kernel duration；对于 multi-kernel call，它比简单相加 kernel duration 更接近 operator GPU span。
+SOL 的特点是用 discovery activity sequence 做归因，并用 activity span 表示一次 logical call 的 GPU 侧 latency。当前实现中的 activity identity 不只是 kernel name，还包括 activity kind，以及 memcpy/memset 的 copy kind、bytes、value 等字段。对于 single-kernel call，span 退化为 kernel duration；对于 multi-activity call，它比简单相加 kernel duration 更接近 operator GPU span。
 
 ## 5. PyTorch `torch.utils.benchmark`
 
@@ -304,7 +304,7 @@ flowchart TB
 
 ## 6. Triton `do_bench`
 
-Triton `do_bench` 使用 CUDA event 计时。它会先运行一次函数并同步，再用 event 粗估 runtime，根据 `warmup` / `rep` 的毫秒预算计算 warmup 次数和 repeat 次数。正式测量时，每次 repeat 清 L2 cache、记录 start event、执行 `fn()`、记录 end event，最后统一同步并统计 event elapsed time。
+Triton `do_bench` 使用 CUDA event 计时。它会先运行一次函数并同步，再用 event 粗估 runtime，根据 `warmup` / `rep` 的毫秒预算计算 warmup 次数和 repeat 次数。正式测量时，在默认 flush L2 的配置下，每次 repeat 清 L2 cache、记录 start event、执行 `fn()`、记录 end event，最后统一同步并统计 event elapsed time。
 
 典型流程是：
 
@@ -316,7 +316,7 @@ n_warmup = warmup_ms / estimate
 n_repeat = rep_ms / estimate
 warmup loop
 for each repeat:
-  clear L2 cache
+  clear L2 cache, if enabled
   start_event.record()
   fn()
   end_event.record()
@@ -338,7 +338,7 @@ FlashAttention 仓库中同时存在几类 benchmark 写法：
 
 这类算子库 benchmark 的核心目标通常是 operator-level latency 和 throughput comparison，而不是 nightly history 中严格的 kernel-only attribution。它们适合比较 FA2/FA3/FlashInfer/cuDNN/PyTorch 等实现的端到端 op 延迟。
 
-## 8. TileOps 四路计时实验事实
+## 8. TileOps 计时路径实验事实
 
 本节记录 TileOps timing 路径选择过程中做过的本地实验事实，只作为方法调研和技术决策的依据，不在这里给出最终 policy。
 
@@ -351,9 +351,9 @@ Kineto 路径更快，不是因为它完全不做 discovery，也不是因为 na
 | 路径 | 主要做法 | 省略或增加的工作 |
 | --- | --- | --- |
 | Kineto/#1797-style | 先用小 profiler pass 判断 single-kernel eligibility；正式 timing 时在 projected windows 中聚合 business kernel duration，并除以 captured kernel count | 省掉 per-repeat `start_cpu/end_cpu` attribution window、timestamp slicing、逐 window sequence matching 和 count validation |
-| SOL native sequence attribution | discovery 得到 expected activity sequence；正式 timing 为每个 repeat 记录 CUPTI timestamp window，并在 window 内匹配 expected sequence | 多了 logical-call 级归因和校验，能更直接识别每次 logical call 的真实 activity 结构 |
+| SOL native sequence attribution | discovery 得到 expected activity identity sequence/counts；正式 timing 为每个 repeat 记录 CUPTI timestamp window，并在 window 内匹配 expected sequence | 多了 logical-call 级归因和校验，能更直接识别每次 logical call 的完整 activity 结构 |
 
-所以 Kineto 路径主要省下的是 **per-repeat attribution / validation** 的工程成本；代价是依赖 Kineto projection window，而这个 projection 没有公开 ready semaphore，可能导致窗口计数或 kernel 归因不稳定。
+所以 Kineto 路径主要省下的是 **per-repeat attribution / validation** 的工程成本；代价是依赖 Kineto projection window，而这个 projection 没有公开 ready semaphore，可能导致窗口计数或 activity 归因不稳定。
 
 ### 8.2 全量 benchmark 对比
 
@@ -394,7 +394,7 @@ single-kernel 范围选择 GEMM 小、中、大三档：
 | medium single-kernel GEMM | 0.100944 ms | 0.100850 ms, -0.09% | 0.119418 ms, +18.3% | 0.127450 ms, +26.3% |
 | large single-kernel GEMM | 1.958222 ms | 1.963246 ms, +0.26% | 1.993260 ms, +1.79% | 2.000512 ms, +2.16% |
 
-这组数据说明：single-kernel 下，SOL native 和 Kineto/CUPTI 测到的是同一种 kernel activity 口径；CUDA event 和 CPU wall 在小 kernel 上会被固定 gap / launch / synchronize overhead 放大。
+这组数据说明：single-kernel 下，SOL native 和 Kineto/CUPTI 都是 kernel activity duration 口径；CUDA event 和 CPU wall 在小 kernel 上会被固定 gap / launch / synchronize overhead 放大。
 
 multi-kernel 范围选择较大的 GQA split 和 GDN forward。下表里的 `SOL native CUPTI` 是捕到的 business kernel duration aggregate / call，用来和 operator span 口径对照；它不应直接作为推荐的 multi-kernel op latency。
 
@@ -434,7 +434,7 @@ missing projected ids [0, 1, 2]
 | 3 | `[985.2, 1084.0]` | `corr=4990 [1046.6, 1064.1]` | `corr=4990 [1063.0, 1216.0]` | yes | 0.236448 ms |
 | 4 | `[1282.1, 1355.0]` | `corr=5053 [1325.8, 1336.7]` | `corr=5053 [1334.6, 1487.2]` | yes | 0.211616 ms |
 
-这个结果说明：repeat 0/1/2 的 CUDA launch API 存在，CUDA event 也记录到非零 operator span；因此这些 logical calls 并不是没有运行。与此同时，Kineto event list 中没有对应 correlation id 的 GPU business kernel activity，所以 projected annotation 也无法产出。
+这个结果说明：repeat 0/1/2 的 CUDA launch API 存在，CUDA event 也记录到非零 operator span；因此这组数据不支持“这些 logical calls 没有运行”的解释。与此同时，Kineto event list 中没有对应 correlation id 的 GPU business kernel activity，所以 projected annotation 也无法产出。
 
 为了验证这不是“GPU activity 整体往后错几轮，导致前几个 CPU annotation 没匹配上”，用 native CUPTI probe 直接记录同类 baseline 的原始时序。结果为：
 
@@ -454,9 +454,9 @@ missing     []
 | 2 | `[547.1, 595.1]` | `corr=2087 [576.9, 588.3]` | `corr=2087 [586.1, 739.0]` |
 | 3 | `[778.6, 824.2]` | `corr=2119 [806.2, 817.6]` | `corr=2119 [815.7, 968.4]` |
 
-Native CUPTI 看到的 kernel start/end 顺序正常，前几轮 business kernel 都能通过 correlation id 归属到对应 repeat；kernel start 通常发生在该 repeat 的 CPU window 内，kernel end 在 CPU window 之后，这是异步 launch 的正常结果。
+Native CUPTI probe 这一次看到的 kernel start/end 顺序正常，前几轮 business kernel 都能通过 correlation id 归属到对应 repeat；kernel start 通常发生在该 repeat 的 CPU window 内，kernel end 在 CPU window 之后，这是异步 launch 的正常结果。
 
-因此，这组实验不支持“整体错位几轮”的解释。更准确的结论是：在 partial trace 中，kernel 实际执行正常、顺序正确；但 Kineto profiler/projection 路径在 session 头部会随机缺少前几个 GPU kernel activity 或无法把它们稳定纳入 projection 结果。该机制没有公开 ready semaphore 或更细的诊断接口，所以继续依赖 `record_function` projection 作为 nightly timing gate 具有不稳定性。
+因此，这组实验不支持“GPU activity 整体错位几轮”的解释。更准确的结论是：Kineto partial trace 中，缺失 repeat 的 CPU annotation、CUDA launch API 和 CUDA event elapsed time 都存在，但 Kineto result 中没有对应 correlation id 的 GPU business kernel activity；另一次 native CUPTI probe 在同一 case 上可以把前几轮 GPU activity 正常归属到对应 repeat。这个对照倾向支持问题与 Kineto profiler/projection 路径的 session 头部 activity 覆盖或归因有关。该机制没有公开 ready semaphore 或更细的诊断接口，所以继续依赖 `record_function` projection 作为 nightly timing gate 具有不稳定性。
 
 ## 9. 参考资料
 
