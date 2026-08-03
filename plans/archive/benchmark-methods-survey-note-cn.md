@@ -407,6 +407,57 @@ multi-kernel 范围选择较大的 GQA split 和 GDN forward。下表里的 `SOL
 
 multi-kernel 下，SOL native 的 CUPTI 数字如果按 kernel duration sum 使用，并不等于 operator latency。CUDA event / CPU wall 更接近 operator span。GDN forward 这类较大的 multi-kernel op 中，二者差距只有几个百分点；GQA split 仍然较短，event span 中固定 gap 占比仍然明显。
 
+### 8.4 Kineto projection 不稳定性定位实验
+
+为了判断 `49/50`、`48/50` 这类现象是不是 CPU annotation 与 GPU activity 整体错位，补做了一个 targeted probe。实验使用同一个 GQA sliding-window long case，分别记录两类信息：
+
+- Kineto trace：每个 repeat 使用唯一 CPU annotation name，保存 CPU annotation、CPU CUDA runtime API、GPU projected annotation、GPU CUDA kernel activity、CUDA event elapsed time。
+- Native CUPTI probe：不使用 Kineto projection；每个 repeat 通过 `cuptiGetTimestamp()` 记录 CPU window，并用 CUPTI external correlation id 直接关联 CUDA runtime API 与 GPU kernel activity。
+
+Kineto trace 抓到一轮 baseline partial sample：
+
+```text
+cpu annotations       50
+cpu cudaLaunchKernel  100
+gpu business kernels  47
+gpu projected anns    47
+missing projected ids [0, 1, 2]
+```
+
+前几轮时序如下，时间单位为 `us`，以 repeat 0 CPU annotation start 为零点：
+
+| repeat | CPU annotation | cudaLaunchKernel | GPU business kernel | projected | CUDA event |
+| ---: | --- | --- | --- | --- | ---: |
+| 0 | `[0.0, 249.9]` | `corr=4801 [158.0, 180.0]` | none | no | 0.536320 ms |
+| 1 | `[411.0, 509.4]` | `corr=4864 [472.6, 485.7]` | none | no | 0.237888 ms |
+| 2 | `[706.7, 790.3]` | `corr=4927 [757.5, 769.7]` | none | no | 0.221088 ms |
+| 3 | `[985.2, 1084.0]` | `corr=4990 [1046.6, 1064.1]` | `corr=4990 [1063.0, 1216.0]` | yes | 0.236448 ms |
+| 4 | `[1282.1, 1355.0]` | `corr=5053 [1325.8, 1336.7]` | `corr=5053 [1334.6, 1487.2]` | yes | 0.211616 ms |
+
+这个结果说明：repeat 0/1/2 的 CUDA launch API 存在，CUDA event 也记录到非零 operator span；因此这些 logical calls 并不是没有运行。与此同时，Kineto event list 中没有对应 correlation id 的 GPU business kernel activity，所以 projected annotation 也无法产出。
+
+为了验证这不是“GPU activity 整体往后错几轮，导致前几个 CPU annotation 没匹配上”，用 native CUPTI probe 直接记录同类 baseline 的原始时序。结果为：
+
+```text
+cpu windows 50
+kernels     100 = 50 L2 flush + 50 business
+dropped     0
+missing     []
+```
+
+前几轮 native CUPTI 时序如下，同样以 repeat 0 CPU window begin 为零点：
+
+| repeat | CPU CUPTI window | cudaLaunchKernel | GPU business kernel |
+| ---: | --- | --- | --- |
+| 0 | `[0.0, 126.9]` | `corr=2023 [95.3, 113.2]` | `corr=2023 [108.0, 262.1]` |
+| 1 | `[306.2, 362.9]` | `corr=2055 [343.6, 355.0]` | `corr=2055 [352.8, 506.6]` |
+| 2 | `[547.1, 595.1]` | `corr=2087 [576.9, 588.3]` | `corr=2087 [586.1, 739.0]` |
+| 3 | `[778.6, 824.2]` | `corr=2119 [806.2, 817.6]` | `corr=2119 [815.7, 968.4]` |
+
+Native CUPTI 看到的 kernel start/end 顺序正常，前几轮 business kernel 都能通过 correlation id 归属到对应 repeat；kernel start 通常发生在该 repeat 的 CPU window 内，kernel end 在 CPU window 之后，这是异步 launch 的正常结果。
+
+因此，这组实验不支持“整体错位几轮”的解释。更准确的结论是：在 partial trace 中，kernel 实际执行正常、顺序正确；但 Kineto profiler/projection 路径在 session 头部会随机缺少前几个 GPU kernel activity 或无法把它们稳定纳入 projection 结果。该机制没有公开 ready semaphore 或更细的诊断接口，所以继续依赖 `record_function` projection 作为 nightly timing gate 具有不稳定性。
+
 ## 9. 参考资料
 
 - NVIDIA SOL-ExecBench timing implementation: https://github.com/NVIDIA/SOL-ExecBench/blob/main/src/sol_execbench/core/bench/timing.py
