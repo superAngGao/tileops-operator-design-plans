@@ -27,7 +27,7 @@ MEMCPY
 MEMSET
 ```
 
-这三类 activity 覆盖了 benchmark 中最常见的 GPU work：kernel launch、显式/隐式 memcpy，以及 memset/clear cache 相关操作。SOL 后续会从这些 activity 中识别用户调用对应的序列，并用这个序列进行正式计时归因。
+这三类 activity 覆盖了 benchmark 中最常见的 GPU work：kernel execution、显式/隐式 memcpy，以及 memset/clear cache 相关操作。SOL 后续会从这些 activity 中识别用户调用对应的序列，并用这个序列进行正式计时归因。
 
 ### 1.1 Iteration 准备
 
@@ -67,9 +67,10 @@ collect CUPTI activities:
   torch.cuda.synchronize()
 ```
 
-然后从这一次用户调用中得到 expected activity sequence：
+然后从这一次用户调用中得到 expected activity sequence，其中包括 kernel name/count 等信息：
 
 ```text
+expected_activity_sequence
 expected_kernel_names
 expected_kernel_counts
 ```
@@ -239,7 +240,7 @@ n_regions == n_repeat
 | --- | --- | --- | --- |
 | CPU annotation window | `record_function` | 标记一次 logical repeat | CPU scope 完整 |
 | GPU projected window | Kineto projection | 过滤 CUDA activity | 没有公开 projection-ready semaphore |
-| CUDA activity event | CUPTI/Kineto | 记录 kernel start/end/duration/name | kernel event 本身完整 |
+| CUDA activity event | CUPTI/Kineto | 记录 kernel start/end/duration/name | 一旦被捕获，event 自身有完整 start/end；但不保证 collection 覆盖每个已 launch kernel |
 
 `torch.cuda.synchronize()` 只能保证 CUDA work drain 完，不能保证 Kineto 已经把每个 CPU annotation scope 稳定投影成 GPU timeline 上的 window。
 
@@ -272,12 +273,12 @@ Kineto 的 CUPTI timing 原理和 NV SOL native CUPTI 并不矛盾：二者正�
 CPU annotation -> projected GPU window -> count regions
 ```
 
-这个 projection 路径没有公开 ready semaphore 或细粒度诊断接口。我们用 native CUPTI CPU timestamp window、external correlation id 和 Kineto projected result 做了 targeted 对照：kernel 实际执行正常，顺序正确；native CUPTI 下 CPU window 与 GPU kernel activity 能通过 correlation id 对上；但 Kineto partial trace 会随机少掉 session 头部几个 projected annotation / GPU activity result。具体实验见 [调研笔记 §8.4](archive/benchmark-methods-survey-note-cn.md#84-kineto-projection-不稳定性定位实验)。
+这个 projection 路径没有公开 ready semaphore 或细粒度诊断接口。我们用 Kineto trace 和 native CUPTI probe 做了 targeted 对照：在 Kineto partial trace 中，缺失 repeat 的 CPU annotation、CUDA launch API 和 CUDA event elapsed time 都存在，但 Kineto result 中没有对应 correlation id 的 GPU business kernel activity；另一次 native CUPTI probe 在同一 case 上可以用 CPU timestamp window 和 external correlation id 把前几轮 GPU kernel activity 正常归属到对应 repeat。这个对照不支持“GPU activity 整体后移几轮”的解释，更支持问题出在 Kineto profiler/projection 路径的 session 头部 activity 覆盖或归因上。具体实验见 [调研笔记 §8.4](archive/benchmark-methods-survey-note-cn.md#84-kineto-projection-不稳定性定位实验)。
 
 因此，当前故障链路是：
 
 ```text
-Kineto projection / activity 归因不稳定
+Kineto projection / activity 归因出现 partial trace
   -> projected window count != n_repeat
   -> CUPTI path 被判失败
   -> fallback 到 CUDA event
@@ -324,14 +325,14 @@ unknown backend latency
 | 方案 | single-kernel op | multi-kernel op | 优点 | 风险 |
 | --- | --- | --- | --- | --- |
 | A. 完全照搬 SOL | native CUPTI kernel duration | native CUPTI activity sequence span | 最完整对齐 NV SOL；不依赖 Kineto projection；可以统一处理 single/multi kernel | 需要确认 SOL-style multi-kernel span 在 TileOps 动态 dispatch、helper kernel、外部 baseline 下都稳定 |
-| B. single-kernel Kineto + multi-kernel CUDA event | Kineto/CUPTI kernel duration | CUDA event operator latency | **更快**；改动较小；延续现有 TileOps profiler infrastructure | 仍依赖 Kineto projection/window；如果 multi-kernel 判定也依赖 Kineto，可能把真实 multi-kernel 误判成 single-kernel |
+| B. single-kernel Kineto + multi-kernel CUDA event | Kineto/CUPTI kernel duration | CUDA event operator latency | **更快**；改动较小；延续现有 TileOps profiler infrastructure | 仍依赖 Kineto projection/window；如果 multi-kernel 判定也依赖 Kineto，可能把实际 multi-kernel 误判成 single-kernel |
 | C. single-kernel SOL native + multi-kernel CUDA event | native CUPTI kernel duration | CUDA event operator latency | 绕开 Kineto projection；保留 fast single-kernel pure kernel time；避免 multi-kernel duration sum 误当 op latency | 比 Kineto 路径慢一些；需要维护 native CUPTI binding 和 discovery 逻辑 |
 
 NCU / NVTX runner 仍然适合作为 diagnostic backend 或 review artifact，用于疑难 case cross-check；但它不是当前 nightly production timing 的自然主路径。
 
 调研实验显示，方案 B 的速度优势是明确存在的，但方案 C 的额外成本没有大到不可接受；同时 single-kernel 的 Kineto/CUPTI 与 SOL native CUPTI latency 基本吻合。具体数据见 [调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-四路计时实验事实)。
 
-方案 B 的根本风险仍然存在：它继续依赖 Kineto projection，而 targeted probe 已经证明这条路径会随机出现头部 partial trace。第一轮中 `torch-sdpa` backward 也出现了 Kineto 侧 `activity_count=150`、SOL native 侧 `activity_count=600` 的差异，说明 Kineto window 内看到的 kernel names/counts 不一定等于 op 的真实 dispatch 结构。
+方案 B 的主要风险仍然存在：它继续依赖 Kineto projection，而 targeted probe 显示这条路径会出现 session 头部 partial trace。第一轮中 `torch-sdpa` backward 也出现了 Kineto 侧 `activity_count=150`、SOL native 侧 `activity_count=600` 的差异，说明 Kineto window 内看到的 kernel names/counts 不一定等于 op 的完整 dispatch 结构。
 
 ### 5.2 当前决策与实现伪代码
 
@@ -350,6 +351,7 @@ profile(fn, args):
       timing = collect_native_cupti_repeats(fn, args, n_repeat, n_trials)
       samples = filter_business_kernels(timing.kernels, name=kernel_names[0])
       validate(samples.count > 0)
+      validate(unique_names(samples) == kernel_names)
       latency = sum(samples.duration) / samples.count
       backend = "native-cupti-single-kernel"
   else:
@@ -360,7 +362,7 @@ profile(fn, args):
   return latency
 ```
 
-这样保留了 SOL native 对真实 CUPTI activity 的直接访问，绕开 Kineto annotation projection；同时避免把 multi-kernel 的 duration sum 误当成 op latency。
+这样保留了 SOL native 对 native CUPTI activity 的直接访问，绕开 Kineto annotation projection；同时避免把 multi-kernel 的 duration sum 误当成 op latency。
 
 相关探索：
 
@@ -394,7 +396,7 @@ timing_diagnostics
 
 ## 6. 结论
 
-TileOps 当前 benchmark 问题不是 “CUPTI 是否可用”，而是当前 Kineto projection 写法会让 CUPTI path 随机失败，并把 latency 口径切到 CUDA event。
+TileOps 当前 benchmark 问题不是 “CUPTI 是否可用”，而是当前 Kineto projection 写法会出现非确定性的 partial trace，并把 latency 口径切到 CUDA event。
 
 ```text
 正常时：
