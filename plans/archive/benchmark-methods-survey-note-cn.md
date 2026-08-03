@@ -63,12 +63,14 @@ flowchart TB
     end
 
     subgraph GPU["Driver / CUDA stream / GPU"]
-        Q0["start-event command<br/>enters stream path"]:::work
+        Q0["start-event command<br/>appended to stream"]:::work
         E0["CUDA event_start timestamp"]:::event
-        G0["pre-kernel stream gap<br/>stream dependency resolution<br/>launch command processing<br/>dispatch latency"]:::work
+        Q1["kernel launch command<br/>function, params, grid/block, stream"]:::work
+        G0["pre-kernel stream gap<br/>stream dependency resolution<br/>GPU front-end launch processing<br/>dispatch latency"]:::work
         K0["CUPTI kernel.start"]:::cupti
         X0["kernel execution<br/>CTAs dispatched to SMs in waves<br/>resident blocks use SM resources"]:::work
         K1["CUPTI kernel.end"]:::cupti
+        Q2["end-event command<br/>appended after kernel command"]:::work
         G1["post-kernel stream gap<br/>kernel completion propagation<br/>stream advances to end event"]:::work
         E1["CUDA event_end timestamp"]:::event
         D0["end_event complete"]:::work
@@ -76,9 +78,9 @@ flowchart TB
 
     T0 --> A0 --> A1 --> A2 --> A3 --> T1
     A0 -. enqueue .-> Q0
-    A1 -. enqueue .-> G0
-    A2 -. enqueue .-> G1
-    Q0 --> E0 --> G0 --> K0 --> X0 --> K1 --> G1 --> E1 --> D0
+    A1 -. enqueue .-> Q1
+    A2 -. enqueue .-> Q2
+    Q0 --> E0 --> Q1 --> G0 --> K0 --> X0 --> K1 --> Q2 --> G1 --> E1 --> D0
     D0 -. unblocks .-> A3
 
     classDef cupti fill:#DBEAFE,stroke:#2563EB,color:#111827
@@ -93,6 +95,17 @@ flowchart TB
 - CUPTI Runtime/Driver API activity 是 host 侧 API 调用的 start/end。`cudaLaunchKernel` 的 API end 只表示 CPU launch 调用返回，不表示 GPU kernel 已经结束。
 - CUPTI kernel activity 的 `kernel_start/kernel_end` 对应 GPU 上 kernel activity 的开始和结束。single-kernel 的 pure kernel time 通常就是 `kernel_end - kernel_start`。
 - SOL-style 的 `cupti.get_timestamp()` 在 CPU 侧取 timestamp，用来形成 attribution window `[t0, t1]`；它本身不是 kernel duration，而是帮助从 CUPTI activity buffer 中挑出属于这次 logical call 的 activity。
+- CPU 线上的 `cudaEventRecord(end)` 可能在 GPU kernel 真正开始前就已经返回；它只是把 end-event command 追加到 kernel command 后面。end event 的 timestamp 仍然要等 stream 顺序推进到它时才产生。
+
+这几条虚线箭头只表示 CPU 侧 CUDA API 调用导致 driver 向 stream 追加 work command，不表示 CPU 直接控制 GPU SM 执行。更具体地说：
+
+| CPU 阶段 | 发给 CUDA runtime / driver 的请求 | 追加到 CUDA stream 的 work |
+| --- | --- | --- |
+| `cuptiGetTimestamp()` | 读取 CUPTI 时间基准上的 host timestamp | 不追加 stream work |
+| `cudaEventRecord(start, stream)` | 请求在指定 stream 的当前位置记录 event | start-event record command；它执行时产生 `event_start_timestamp` |
+| `cudaLaunchKernel(..., stream)` | 提交 kernel function、grid/block、dynamic shared memory、参数指针/值和目标 stream；driver 可能做参数打包、lazy module/context 检查、launch descriptor / command buffer 准备 | kernel launch command；GPU 前端按 stream 顺序处理后，首批 CTA 开始执行时形成 CUPTI `kernel.start` |
+| `cudaEventRecord(end, stream)` | 请求在同一 stream 中、排在 kernel command 之后记录 event | end-event record command；它执行时产生 `event_end_timestamp` |
+| `cudaEventSynchronize(end)` | CPU 等待这个 event complete；通常是 host blocking/polling 和 driver 状态查询 | 通常不追加新的业务 stream work；等 GPU 执行完 end-event command 后返回 |
 
 对于一个 single-kernel callable，CUDA event span 比 CUPTI single-kernel duration 多包了两个 stream gap：
 
@@ -457,6 +470,28 @@ missing     []
 Native CUPTI probe 这一次看到的 kernel start/end 顺序正常，前几轮 business kernel 都能通过 correlation id 归属到对应 repeat；kernel start 通常发生在该 repeat 的 CPU window 内，kernel end 在 CPU window 之后，这是异步 launch 的正常结果。
 
 因此，这组实验不支持“GPU activity 整体错位几轮”的解释。更准确的结论是：Kineto partial trace 中，缺失 repeat 的 CPU annotation、CUDA launch API 和 CUDA event elapsed time 都存在，但 Kineto result 中没有对应 correlation id 的 GPU business kernel activity；另一次 native CUPTI probe 在同一 case 上可以把前几轮 GPU activity 正常归属到对应 repeat。这个对照倾向支持问题与 Kineto profiler/projection 路径的 session 头部 activity 覆盖或归因有关。该机制没有公开 ready semaphore 或更细的诊断接口，所以继续依赖 `record_function` projection 作为 nightly timing gate 具有不稳定性。
+
+### 8.5 CUDA event / CPU wall 额外延迟的定量实验
+
+为了定量回答 `CUDA event` 相对 `CUPTI kernel activity`、以及 `CPU wall` 相对 `CUDA event` 各自多出多少时间，补做了一个同次调用实验。实验使用 `torch.add(fp16)` single-kernel callable，选择小、中、大三档输入；每个 case 跑 `10 cycles * 50 repeats = 500 samples`。每个 repeat 前执行 L2 flush 和 `torch.cuda.synchronize()`，同一次 kernel 调用中同时记录：
+
+```text
+CUPTI kernel duration
+CUDA event elapsed time
+CPU wall time around timestamp sampling + launch + end_event record + synchronize
+```
+
+同次记录的目的，是避免把三种 backend 分开运行后再相减时引入 run-to-run 抖动。实验中 native CUPTI 每轮均捕获 `50/50` 个 business kernel。
+
+| case | CUPTI mean / std | CUDA event mean / std | CPU wall mean / std | CUDA event - CUPTI mean / std | CPU wall - CUDA event mean / std |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| small add 8k | 1.87 us / 0.16 us | 22.32 us / 6.16 us | 35.70 us / 7.12 us | 20.45 us / 6.17 us | 13.38 us / 2.50 us |
+| medium add 4M | 9.09 us / 0.24 us | 24.10 us / 5.79 us | 37.09 us / 7.41 us | 15.00 us / 5.80 us | 12.99 us / 2.80 us |
+| large add 32M | 49.96 us / 0.66 us | 59.55 us / 3.43 us | 71.07 us / 3.68 us | 9.59 us / 3.40 us | 11.52 us / 1.71 us |
+
+这组实验的直接结论是：对于 single-kernel fast op，CUDA event 相比 CUPTI kernel-only duration 会多出约 `10-20 us`，小 kernel 上甚至远大于 kernel 本身；CPU wall 相比 CUDA event 又多出约 `11-13 us`。因此，当 Kineto/CUPTI 路径 fallback 到 CUDA event 或 CPU wall 时，小 kernel latency 会被固定开销显著放大，且标准差也会变大。
+
+这里的 CPU wall 是为了同次采样而加入 CUPTI timestamp sampling 和 event record 的 instrumented wall time，不能完全等同于生产 benchmark 中最小化 instrumentation 的 wall timer；但它足以展示量级：`CUPTI kernel activity < CUDA event span < CPU wall`，且越小的 kernel 越容易被额外固定开销主导。
 
 ## 9. 参考资料
 
