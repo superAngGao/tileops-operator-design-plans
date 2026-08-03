@@ -409,7 +409,7 @@ single-kernel 范围选择 GEMM 小、中、大三档：
 
 这组数据说明：single-kernel 下，SOL native 和 Kineto/CUPTI 都是 kernel activity duration 口径；CUDA event 和 CPU wall 在小 kernel 上会被固定 gap / launch / synchronize overhead 放大。
 
-multi-kernel 范围选择较大的 GQA split 和 GDN forward。下表里的 `SOL native CUPTI` 是捕到的 business kernel duration aggregate / call，用来和 operator span 口径对照；它不应直接作为推荐的 multi-kernel op latency。
+multi-kernel 范围选择较大的 GQA split 和 GDN forward。下表里的 `SOL native CUPTI` 是捕到的 business activity span / call，也就是选中 activity sequence 后的 `max(end) - min(start)`；它不是把每个 kernel duration 简单相加。
 
 | case | SOL native CUPTI | Kineto/#1797 | CUDA event | CPU wall |
 | --- | ---: | ---: | ---: | ---: |
@@ -418,7 +418,7 @@ multi-kernel 范围选择较大的 GQA split 和 GDN forward。下表里的 `SOL
 
 这里的 `300/150` 表示 150 次 logical calls 捕到 300 个 business kernels，也就是每 call 2 个 kernel；`900/150` 表示每 call 6 个 kernel。Kineto/#1797 按预期识别为 multi-kernel 并 fallback 到 CUDA event。
 
-multi-kernel 下，SOL native 的 CUPTI 数字如果按 kernel duration sum 使用，并不等于 operator latency。CUDA event / CPU wall 更接近 operator span。GDN forward 这类较大的 multi-kernel op 中，二者差距只有几个百分点；GQA split 仍然较短，event span 中固定 gap 占比仍然明显。
+multi-kernel 下，SOL native 的 CUPTI 数字是 activity span，能覆盖第一个选中 activity start 到最后一个选中 activity end 之间的 GPU 侧执行跨度。CUDA event / CPU wall 还会额外包含 event command、stream gap、host launch 和同步等待等开销。GDN forward 这类较大的 multi-kernel op 中，几种口径差距只有几个百分点；GQA split 仍然较短，event span 中固定 gap 占比仍然明显。
 
 ### 8.4 Kineto projection 不稳定性定位实验
 

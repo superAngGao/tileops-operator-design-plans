@@ -6,11 +6,11 @@
 
 TileOps 最初希望 benchmark 基础设施对齐 NVIDIA SOL-ExecBench：固定 warmup/repeat/trial、L2 flush、输入地址扰动、锁频和稳定报告口径。实际落地时，TileOps 采用了 `torch.profiler` / Kineto 暴露的 CUPTI CUDA activity，并通过 `record_function` projection 判断每个 repeat 的 GPU 计时窗口。
 
-重新核对 NV SOL 代码后，需要纠正一个历史混淆：NV SOL 当前默认 timing methodology 是 **native CUPTI activity timing**。当前 TileOps 的主要问题集中在 Kineto projection 依赖：当 projected annotation window 数不是 `n_repeat` 时，benchmark fallback 到 CUDA events。CUDA events 对 fast kernels 会带入 launch overhead，使 nightly latency 和 roofline 数据不可直接与 CUPTI kernel-only history 混合比较。
+重新核对 NV SOL 代码后，需要纠正一个历史混淆：NV SOL 当前默认 timing methodology 是 **native CUPTI activity timing**。当前 TileOps 的主要问题集中在 Kineto projection 依赖：当 projected annotation window 数不是 `n_repeat` 时，benchmark fallback 到 CUDA events。CUDA events 对 fast kernels 会带入 launch overhead，使 nightly latency 和 roofline 数据不可直接与 CUPTI activity / kernel-only history 混合比较。
 
 本轮实验进一步确认：当两条路径都测到 single-kernel CUPTI activity 时，Kineto 和 SOL native 的 latency 基本吻合；主要差异来自 Kineto 大量 fallback 到 CUDA events。全量 benchmark 与同 case 四路计时对比数据见 [GPU benchmark 方法调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-计时路径实验事实)。
 
-当前决策是：**以 SOL native CUPTI 作为 TileOps benchmark 主路径；使用 native CUPTI discovery 识别 activity identity / kernel name / count；single-kernel op 使用 CUPTI kernel duration；multi-kernel op 先保守 fallback 到 CUDA events**。这样避免继续依赖 Kineto projection，同时避免把 multi-kernel duration sum 误当成 operator latency。
+当前决策是：**以 SOL native CUPTI activity attribution 作为 TileOps benchmark 主路径；使用 native CUPTI discovery 识别 expected activity identity sequence / counts；正式计时按 NV SOL 方式选择每次 logical call 的 activity sequence，并用 `max(activity.end) - min(activity.start)` 作为 GPU 侧 latency**。这样同时覆盖 single-kernel 和 multi-kernel op，避免继续依赖 Kineto projection，也避免把 CUDA event 固定 gap 混入默认 latency 口径。
 
 ## 1. NV SOL 的具体流程
 
@@ -67,12 +67,12 @@ collect CUPTI activities:
   torch.cuda.synchronize()
 ```
 
-然后从这一次用户调用中得到 expected activity sequence，其中包括 kernel name/count 等信息：
+然后从这一次用户调用中得到 expected activity sequence，其中包括 activity identity / count 等信息：
 
 ```text
 expected_activity_sequence
-expected_kernel_names
-expected_kernel_counts
+expected_activity_identities
+expected_activity_counts
 ```
 
 这一步的目的是建立“用户调用应该长什么样”的 GPU activity 指纹。后续正式计时不会盲目使用一个 window 内的全部 activity，而是尝试从 window 内选出和 discovery 一致的 activity sequence。这样可以把 setup/cache/helper noise 和被测用户调用区分开。
@@ -259,7 +259,7 @@ CUPTI kernel-only latency: 约 0.009 ms
 CUDA event latency:       约 0.067 ms
 ```
 
-这类数据不能和 CUPTI kernel-only history 直接混合做 regression / best / roofline 判断。
+这类数据不能和 CUPTI activity / kernel-only history 直接混合做 regression / best / roofline 判断。
 
 ## 4. 当前具体问题
 
@@ -300,7 +300,7 @@ Nightly 中可见的典型形态是：
 Nightly artifact 能看到 `timing = cuda-events`，但历史比较文件没有完整保存 timing backend / fallback reason / CUPTI mismatch diagnostics。结果是：
 
 ```text
-CUPTI kernel-only latency
+CUPTI activity / kernel-only latency
 CUDA event latency
 unknown backend latency
 ```
@@ -326,43 +326,39 @@ unknown backend latency
 | --- | --- | --- | --- | --- |
 | A. 完全照搬 SOL | native CUPTI kernel duration | native CUPTI activity sequence span | 最完整对齐 NV SOL；不依赖 Kineto projection；可以统一处理 single/multi kernel | 需要确认 SOL-style multi-kernel span 在 TileOps 动态 dispatch、helper kernel、外部 baseline 下都稳定 |
 | B. single-kernel Kineto + multi-kernel CUDA event | Kineto/CUPTI kernel duration | CUDA event operator latency | **更快**；改动较小；延续现有 TileOps profiler infrastructure | 仍依赖 Kineto projection/window；如果 multi-kernel 判定也依赖 Kineto，可能把实际 multi-kernel 误判成 single-kernel |
-| C. single-kernel SOL native + multi-kernel CUDA event | native CUPTI kernel duration | CUDA event operator latency | 绕开 Kineto projection；保留 fast single-kernel pure kernel time；避免 multi-kernel duration sum 误当 op latency | 比 Kineto 路径慢一些；需要维护 native CUPTI binding 和 discovery 逻辑 |
+| C. single-kernel SOL native + multi-kernel CUDA event | native CUPTI kernel duration | CUDA event operator latency | 绕开 Kineto projection；保留 fast single-kernel pure kernel time；实现上比完整 sequence attribution 更保守 | 与 NV SOL 当前 multi-activity span 口径不完全一致；multi-kernel 会混入 event gap |
 
 NCU / NVTX runner 仍然适合作为 diagnostic backend 或 review artifact，用于疑难 case cross-check；但它不是当前 nightly production timing 的自然主路径。
 
-调研实验显示，方案 B 的速度优势是明确存在的，但方案 C 的额外成本没有大到不可接受；同时 single-kernel 的 Kineto/CUPTI 与 SOL native CUPTI latency 基本吻合。具体数据见 [调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-计时路径实验事实)。
+调研实验显示，方案 B 的速度优势是明确存在的，但 SOL native 的额外成本没有大到不可接受；同时 single-kernel 的 Kineto/CUPTI 与 SOL native CUPTI latency 基本吻合。重新核对 SOL 代码后，方案 A 对 multi-kernel op 使用的是 activity sequence span，不是 kernel duration sum，因此它也能给 multi-kernel logical call 提供统一的 GPU 侧 latency 口径。具体数据见 [调研笔记 §8](archive/benchmark-methods-survey-note-cn.md#8-tileops-计时路径实验事实)。
 
 方案 B 的主要风险仍然存在：它继续依赖 Kineto projection，而 targeted probe 显示这条路径会出现 session 头部 partial trace。第一轮中 `torch-sdpa` backward 也出现了 Kineto 侧 `activity_count=150`、SOL native 侧 `activity_count=600` 的差异，说明 Kineto window 内看到的 kernel names/counts 不一定等于 op 的完整 dispatch 结构。
 
 ### 5.2 当前决策与实现伪代码
 
-本轮决策不再把 Kineto projection 作为主要修补方向，而是吸收 NV SOL 的 native CUPTI discovery / activity attribution 机制。该决策采用方案 C：**single-kernel SOL native + multi-kernel CUDA event**。
+本轮决策不再把 Kineto projection 作为主要修补方向，而是吸收 NV SOL 的 native CUPTI discovery / activity attribution 机制。该决策采用方案 A：**完整 SOL native CUPTI activity attribution**。
 
 ```text
 profile(fn, args):
   warmup(fn, args)
 
   discovery = collect_native_cupti_once(fn, args)
-  business = filter_business_kernels(discovery.kernels)
-  kernel_names = unique_names(business)
-  kernels_per_call = len(business)
+  expected = derive_expected_activity_sequence(discovery)
+  expected_counts = count_activity_identities(expected)
 
-  if kernels_per_call == 1 and len(kernel_names) == 1:
-      timing = collect_native_cupti_repeats(fn, args, n_repeat, n_trials)
-      samples = filter_business_kernels(timing.kernels, name=kernel_names[0])
-      validate(samples.count > 0)
-      validate(unique_names(samples) == kernel_names)
-      latency = sum(samples.duration) / samples.count
-      backend = "native-cupti-single-kernel"
-  else:
-      latency = measure_cuda_event_span(fn, args, n_repeat, n_trials)
-      backend = "cuda-event-multi-kernel"
+  timing = collect_native_cupti_repeats(fn, args, n_repeat, n_trials)
+  latencies = []
+  for repeat_window in timing.cpu_timestamp_windows:
+      candidates = activities_started_inside(repeat_window)
+      selected = select_expected_sequence(candidates, expected)
+      validate(count_activity_identities(selected) == expected_counts)
+      latencies.append(max(a.end for a in selected) - min(a.start for a in selected))
 
-  record timing backend, kernel names/counts, sampled count, fallback reason
-  return latency
+  record timing backend, expected activity identities/counts, sampled call count, diagnostics
+  return median_trial_mean(latencies)
 ```
 
-这样保留了 SOL native 对 native CUPTI activity 的直接访问，绕开 Kineto annotation projection；同时避免把 multi-kernel 的 duration sum 误当成 op latency。
+这样保留了 SOL native 对 native CUPTI activity 的直接访问，绕开 Kineto annotation projection。single-kernel 时，activity span 退化为 kernel duration；multi-kernel 或 memcpy/memset + kernel sequence 时，activity span 表示第一个选中 activity start 到最后一个选中 activity end 的 GPU 侧 logical-call span。CUDA event 不再是 multi-kernel 的默认路径，只在 native CUPTI attribution 明确失败或用于诊断 cross-check 时使用，并必须在 artifact 中记录 backend / fallback reason。
 
 相关探索：
 
@@ -374,7 +370,8 @@ profile(fn, args):
 
 - single-kernel 时，SOL native CUPTI 与 Kineto/CUPTI 的 latency 基本一致；
 - fast single-kernel 如果 fallback 到 CUDA event / CPU wall，会被固定开销显著放大；
-- multi-kernel 时，kernel duration sum 与 operator latency 不是同一口径，CUDA event / CPU wall 更接近 operator span；
+- multi-kernel 时，NV SOL native CUPTI 使用 activity span，而不是 kernel duration sum，可以给出 GPU 侧 logical-call span；
+- CUDA event / CPU wall 仍可作为 operator-level end-to-end 参考，但会额外包含 event gap、host launch 和同步等待等非 kernel activity；
 - SOL native 比 Kineto 路径慢一些，但全量成本差异在可接受范围内。
 
 ### 5.3 Artifact 数据治理
@@ -384,11 +381,10 @@ profile(fn, args):
 ```text
 timing_backend
 fallback_reason
-business_kernel_names
-business_kernel_count_per_call
-captured_cuda_kernel_count
+business_activity_identities
+business_activity_count_per_call
+captured_cupti_activity_count
 sampled_call_count
-cupti_activity_count
 timing_diagnostics
 ```
 
@@ -408,12 +404,12 @@ TileOps 当前 benchmark 问题不是 “CUPTI 是否可用”，而是当前 Ki
     -> small kernel latency 被固定开销放大
 ```
 
-主路径应转向 native CUPTI discovery，避免继续把 nightly timing gate 绑在 `record_function` projection 上。最终推荐方向是方案 C：
+主路径应转向 native CUPTI discovery，避免继续把 nightly timing gate 绑在 `record_function` projection 上。最终推荐方向是方案 A：
 
 | op 类型 | timing backend | latency 语义 |
 | --- | --- | --- |
-| single-kernel | native CUPTI | kernel-only duration |
-| multi-kernel | CUDA event | operator-level stream span |
+| single-kernel | native CUPTI | selected activity span，退化为 kernel duration |
+| multi-kernel / multi-activity | native CUPTI | selected activity sequence span，`max(end) - min(start)` |
 
 同时，artifact 必须完整记录 timing provenance，保证 history / regression / roofline 只比较同口径数据。
 
