@@ -99,12 +99,14 @@ SOL 可借鉴点：
 | 2026-08-04 | `ghcr.io/tile-ai/tileops-runner:65dbc98-torch2.10`；GPU0 H200；`Exclusive_Process`；1500 MHz；共享 cache | default prewarm runner | `bench_independent_elementwise.py`、`bench_logical_reduce.py`、`bench_gemm.py` | 退出码 1，总耗时 154s。第一个文件通过；后两个文件在创建 CUDA tensor 时出现 `cudaErrorDevicesUnavailable`。 |
 | 2026-08-04 | 同上 | strict serial runner | 同上 | 退出码 0，总耗时 172s。三个文件全部通过；每个文件后等待到 `teardown complete` 再启动下一个 child。 |
 | 2026-08-04 | 同上；default prewarm runner；collect 阶段加 GPU-silent probe | collect/import GPU-silent 检查 | 同上 | 三个 child collect 完成时均为 `torch_loaded=True`、`cuda_initialized=False`、`gpu_rows=[]`；随后第二、第三个文件在正式 pytest 创建 CUDA tensor 时仍出现 `cudaErrorDevicesUnavailable`。 |
+| 2026-08-04 | 官方 runner 镜像；GPU3 H200；1500 MHz；共享 cache；strict serial；`--prewarm 0`；host pmon 采样 | 全量 `benchmarks/ops` | 59 个 benchmark file | 总 wall time 2357.58s；未出现 `cudaErrorDevicesUnavailable`；pmon 463 个采样点中没有同时出现多个 GPU compute process；5 个 file 因 native CUPTI attribution fail-closed。 |
 
 初步解读：
 
 - 在 GPU `Exclusive_Process` 下，当前 default prewarm runner 可以触发后续 child 拿不到 CUDA device 的问题。
 - strict serial runner 能消除这组小规模测例中的 device unavailable 失败。
 - collect/import 在这组三个文件上没有初始化 CUDA，也没有在 collect 完成时出现在 GPU compute app 列表中；因此当前证据不支持“prewarm collect 阶段抢 GPU”是直接原因。
+- 全量实验中有 7 个 benchmark file 在 collect/import 阶段已经 `cuda_initialized=True`，但 strict serial 下它们没有和其他 benchmark file 的测量阶段重叠；后续 artifact 仍应记录这类信息。
 - 剩余风险点是 child release 后正式 pytest 与上一个 child 的 CUDA context / interpreter teardown 重叠；但这个 root cause 不再作为主方案 blocker。
 - 主路径采用 strict serial。prewarm 仅保留为未来成本优化方向；只有在额外证明不会影响 GPU context 和 latency 稳定性后再考虑恢复。
 
@@ -259,6 +261,20 @@ SOL 可借鉴点：
 
    per-file subprocess isolation 仍然保留，用于限制 crash、hang、OOM 的影响面。strict serial 只改变 child 调度顺序，不取消隔离。
 
+6. **全量实验中的真实 fail-closed 结果**
+
+   strict serial + native CUPTI + SOL-style prepare path 的全量实验中，失败集中在 attribution 语义本身，而不是 GPU unavailable：
+
+   ```text
+   bench_convolution.py          discovery sequence inconsistent / no sequence
+   bench_elementwise_manifest.py timing attributed 48/50
+   bench_grouped_gemm.py         timing attributed 39/50
+   bench_norm.py                 timing attributed 47/50、49/50；discovery inconsistent / no sequence
+   bench_vector_norm.py          timing attributed 40/50、48/50、49/50
+   ```
+
+   这些失败没有静默 fallback 到 CUDA event，也没有生成可混用 latency。下一步需要改进 native CUPTI attribution 策略，例如允许完整 sequence 的部分样本进入统计，或对 discovery 不稳定的 workload 做更明确的分类与诊断。
+
 暂缓项：
 
 - perf history 的 schema 迁移可以单独设计；但在 native CUPTI PR 中至少要保证新字段进入当前 artifact，避免再次出现 backend/fallback 不可见的问题。
@@ -332,6 +348,21 @@ SOL 可借鉴点：
 
 结论：first-call 和 warmup 可以放在 native CUPTI discovery/timing 之前；正式 latency 只来自 discovery 后的 timed repeats。
 
+实现核对：
+
+- 输入 clone pool、L2 flush buffer allocation、第一次 `_prepare_iteration()` 和第一次 `_run()` 都在 native CUPTI discovery/timing 之前。
+- discovery 和 timing 的每个 repeat 都使用同一个顺序：
+
+  ```text
+  prepare_iteration()
+  begin_repeat() / cuptiGetTimestamp()
+  runner(args)
+  torch.cuda.synchronize()
+  end_repeat() / cuptiGetTimestamp()
+  ```
+
+- 因此 L2 flush、persisting L2 reset、首次调用、warmup 都不应进入正式 latency sample。全量实验中仍有 7 个文件在 pytest collect/import 阶段初始化 CUDA，这属于 runner 生命周期信息，需要记录，但在 strict serial 下不和其他 file 的正式 timing 重叠。
+
 ## 7. 次要目标二：运行成本可控
 
 判断：最后再扫。当前优先级是先把前四个主需求做准，再看能不能优化运行时间。
@@ -383,6 +414,33 @@ SOL 可借鉴点：
 
 - prewarm fast path 的收益和风险后续再评估；当前不继续把它作为 blocker。
 
+全量实验记录：
+
+| 日期 | 环境 | 配置 | 结果 |
+| --- | --- | --- | --- |
+| 2026-08-04 | 官方 runner 镜像；GPU3 H200；1500 MHz；共享 cache | strict serial；`--prewarm 0`；native CUPTI；SOL-style prepare path；CUDA event fallback disabled | 59 个 file 全部执行；总 wall time 2357.58s；child elapsed sum 2215.47s；5 个 file fail-closed；无 `cudaErrorDevicesUnavailable`。 |
+
+耗时分布：
+
+```text
+top 5 files  = 1289.42s，占 child elapsed 58.2%
+top 10 files = 1539.44s，占 child elapsed 69.5%
+top 15 files = 1678.13s，占 child elapsed 75.7%
+runner / docker / teardown 等非 child elapsed 差值约 142.11s，占 wall time 6.0%
+```
+
+最重文件：
+
+```text
+bench_grouped_gemm_baselines.py 640.42s
+bench_gqa.py                    259.13s
+bench_gqa_sliding_window.py     159.41s
+bench_gemm.py                   148.39s
+bench_moe_fused_moe.py           82.08s
+```
+
+结论：当前 strict serial + native CUPTI 的全量成本约 39.3 分钟，成本可控；主要耗时来自少数重 benchmark file，而不是 runner 串行化本身。prewarm 即使恢复，理论收益也主要来自约 142s 的非 child elapsed 和部分 collect/import 隐藏成本；在 attribution 正确性稳定之前，优化优先级低于 native CUPTI attribution 策略收敛。
+
 ## 8. 实验矩阵与状态
 
 本轮先按机制收敛顺序完成小规模验证：重复测量前后无污染、初始化边界、可观测性和 strict serial runner。全量 benchmark cost 需要等 native CUPTI + strict serial + SOL-style prepare path 合成到同一实现后再测。
@@ -393,7 +451,7 @@ SOL 可借鉴点：
 | 2 | Cache / address policy | 验证 SOL-style persisting L2 reset、L2 clear 和 shifting allocator 的稳定性。 | fixed address、3-clone、shifting allocator；current flush vs reset persisting L2 + `2 * L2_cache_size` clear。 | latency mean/std/p90、outlier、地址策略是否引入稳定偏差。 | 已完成小范围验证：三种 address policy 在 `torch.add` 上结果接近；SOL-style cache policy 不破坏 attribution。 |
 | 3 | Initialization boundary | 确认 first-call / warmup / discovery / timing 边界能吸收 lazy init。 | `first-call -> warmup -> discovery -> timing`。 | discovery 不进入 latency sample；timed repeat 中 sequence 稳定。 | 已完成基础验证：`torch.add` discovery 3/3、timing 10/10；正式 latency 只来自 discovery 后 timing。 |
 | 4 | Artifact / failure observability | 验证错误不会静默混入正式性能数据。 | 构造 CUPTI dropped、sequence mismatch、sample count mismatch、partial trace。 | 错误是否 fail closed；是否给出明确 failure reason。 | 已完成：四类故障都明确报错，没有静默生成 latency。 |
-| 5 | Full benchmark cost | 在正确性路径稳定后评估全量运行成本。 | 当前 main / strict serial + native CUPTI + SOL-style prepare path / 必要 debug mode。 | 全量耗时、单文件耗时分布、artifact 体积、nightly 可接受性。 | 待正式实现合并后执行；不作为本轮机制设计 blocker。 |
+| 5 | Full benchmark cost | 在正确性路径稳定后评估全量运行成本。 | strict serial + native CUPTI + SOL-style prepare path；fallback disabled；全量 `benchmarks/ops`。 | 全量耗时、单文件耗时分布、pass/fail files、GPU 干扰情况。 | 已完成一轮：wall time 2357.58s；无 GPU unavailable；5 个 file 因 native CUPTI attribution fail-closed。 |
 
 实验执行原则：
 
