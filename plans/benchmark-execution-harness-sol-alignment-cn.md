@@ -4,7 +4,7 @@
 
 ## 1. 目标
 
-这份笔记只讨论 benchmark execution harness，不重新展开 timing backend 的取舍。当前方向是保留 CUPTI activity timing 原则，并把 execution harness 的设计目标收敛成四个主需求和两个次要目标。
+这份笔记只讨论 benchmark execution harness，不重新展开 timing backend 的取舍。当前方向是保留 CUPTI activity timing 原则，并把 execution harness 的设计目标收敛成四个主需求和一个次要目标。
 
 主需求：
 
@@ -18,8 +18,7 @@
 次要目标：
 
 ```text
-5. 初始化开销移出正式窗口
-6. 运行成本可控
+5. 运行成本可控
 ```
 
 这里默认 TileOps 与 baseline 使用同一套 benchmark 执行口径。后续所有具体实现，例如 native CUPTI discovery、L2 flush、input address policy、strict serial runner，都应该服务于这些需求。
@@ -122,6 +121,7 @@ TileOps 现状：
 - L2 flush buffer 使用实际 L2 size；当前 main 没有调用 `cudaCtxResetPersistingL2Cache()`。
 - 输入 tensor 默认预 clone 3 份 pool，按 `i % 3` 轮换；总输入超过 1 GiB 时跳过 clone 并记录 `inputs_cloned=False`。
 - case 结束后，pytest hook 调用 `gc.collect()` 和 `torch.cuda.empty_cache()`。
+- 多数 TileOps benchmark 先构造 op、完成 `tune=True` 触发的 autotune，再进入 `bench_kernel()`。正式方向使用 CUPTI activity timing，CPU 侧 JIT/cache miss 时间不会直接进入 latency；因此 TileOps 当前没有显著的独立预编译需求。
 
 我们的需求：
 
@@ -129,6 +129,7 @@ TileOps 现状：
 - flush/setup work 不能进入被测 user activity sequence。
 - repeat 之间不能通过固定 data pointer、输出残留、allocator 状态或 L2 命中状态产生隐藏耦合。
 - 大输入无法 clone 时，要在结果中显式标记，不和正常地址扰动数据混用。
+- warmup 仍然保留，但它是 steady-state 边界的一部分：用于让 CUDA context/module/library、allocator 和外部 baseline lazy state 在 discovery/timing 前稳定，而不是作为单独的预编译目标。
 
 SOL 可借鉴点：
 
@@ -193,6 +194,7 @@ SOL 可借鉴点：
 - 在 single-kernel 和 multi-kernel case 上，`prepare_iteration()` 中的 flush work 都没有泄入 user activity sequence。
 - SOL-style `cudaCtxResetPersistingL2Cache() + 2 * L2 cache clear` 不破坏 native CUPTI attribution。
 - `fixed address / 3-clone / shifting address` 在这组小范围 `torch.add` 中结果接近；正式方案仍采用 shifting allocator，因为它更符合“repeat 之间无地址复用污染”的需求。
+- TileOps 选择 CUPTI activity timing 后，即便发生 cache miss 或 CPU 侧 JIT，也不会直接进入正式 latency；初始化边界不再作为独立目标，只在本需求下约束 discovery/timing 前的 steady-state。
 
 ## 5. 主需求四：可观测、可追溯
 
@@ -290,80 +292,7 @@ SOL 可借鉴点：
 
 结论：native CUPTI 正式路径可以 fail closed；activity dropped、sequence 错误、sample count 不足都不会静默生成 latency。
 
-## 6. 次要目标一：初始化开销移出正式窗口
-
-判断：这一项现在应该基本有覆盖，而且参考 SOL 的做法相对直接；它和 timing backend 相对独立，可以在主需求稳定后继续收紧。
-
-TileOps 现状：
-
-- `bench_kernel` 有 10 次 warmup。
-- TileLang/Triton 编译、autotune、CUDA context init、module load、library handle init 通常应在第一次调用或 warmup 中发生。
-- 共享 cache 能减少 nightly 中的重复编译成本。
-
-我们的需求：
-
-- JIT、compile、autotune、context init、module load、library handle init、allocator 扩容不进入正式 timed repeat。
-- 如果某些 lazy init 只能在被测 callable 第一次调用时触发，应通过 first-call 或 warmup 明确吸收。
-- 初始化失败和 cache miss 应进入 debug 信息，而不是表现为 latency regression。
-
-SOL 可借鉴点：
-
-- SOL evaluation 在正式 timing 前先做 user function correctness / round-0 call，注释中说明 round 0 也用于吸收 JIT/compiler 线程启动。
-- SOL timing 有明确 warmup 阶段，warmup work 不进入 CUPTI timing result。
-
-我们的解法：
-
-1. **保留 first-call / warmup / discovery / timing 的四段结构**
-
-   ```text
-   first-call / correctness / compile trigger
-     -> warmup
-     -> native CUPTI discovery
-     -> native CUPTI timed repeats
-   ```
-
-   first-call 和 warmup 用来吸收 CUDA context init、TileLang/Triton compile、autotune、module load、library handle init、allocator 扩容等一次性成本。
-
-2. **warmup 不进入 CUPTI timing result**
-
-   warmup 只用于进入 steady state；正式 latency 只能来自 discovery 之后的 timed repeats。
-
-3. **discovery 也不作为 latency sample**
-
-   discovery 只建立 expected activity sequence / counts，不参与最终 latency 统计。这样 discovery 中偶发的 lazy 初始化不会污染正式结果；如果 discovery sequence 不稳定，直接 fail closed 或进入 diagnostic。
-
-4. **cache miss / lazy init 进入诊断信息**
-
-   对可能 lazy init 的 op/baseline 保留 debug logging 或 artifact 字段。初始化失败、compile miss、autotune miss 不应表现为普通 latency regression。
-
-暂缓项：
-
-- 是否为每个 op 增加显式 first-call API 可以后续再定；当前实现可以先通过 warmup 前的一次 `_run()` 或现有 correctness path 吸收首次调用成本。
-
-本轮实验结果：
-
-| 日期 | 环境 | 流程 | 结果 |
-| --- | --- | --- | --- |
-| 2026-08-04 | 官方 runner 镜像；GPU0 H200；共享 cache；native CUPTI probe | `first-call -> 5 warmup -> 3 discovery -> 10 timing`，`torch.add` 单 kernel | discovery 3/3，timing 10/10；`dropped=0`；flush kernel 全部在 window 外；timing mean 9.075 us，std 0.143 us。 |
-
-结论：first-call 和 warmup 可以放在 native CUPTI discovery/timing 之前；正式 latency 只来自 discovery 后的 timed repeats。
-
-实现核对：
-
-- 输入 clone pool、L2 flush buffer allocation、第一次 `_prepare_iteration()` 和第一次 `_run()` 都在 native CUPTI discovery/timing 之前。
-- discovery 和 timing 的每个 repeat 都使用同一个顺序：
-
-  ```text
-  prepare_iteration()
-  begin_repeat() / cuptiGetTimestamp()
-  runner(args)
-  torch.cuda.synchronize()
-  end_repeat() / cuptiGetTimestamp()
-  ```
-
-- 因此 L2 flush、persisting L2 reset、首次调用、warmup 都不应进入正式 latency sample。全量实验中仍有 7 个文件在 pytest collect/import 阶段初始化 CUDA，这属于 runner 生命周期信息，需要记录，但在 strict serial 下不和其他 file 的正式 timing 重叠。
-
-## 7. 次要目标二：运行成本可控
+## 6. 次要目标：运行成本可控
 
 判断：最后再扫。当前优先级是先把前四个主需求做准，再看能不能优化运行时间。
 
@@ -441,17 +370,16 @@ bench_moe_fused_moe.py           82.08s
 
 结论：当前 strict serial + native CUPTI 的全量成本约 39.3 分钟，成本可控；主要耗时来自少数重 benchmark file，而不是 runner 串行化本身。prewarm 即使恢复，理论收益也主要来自约 142s 的非 child elapsed 和部分 collect/import 隐藏成本；在 attribution 正确性稳定之前，优化优先级低于 native CUPTI attribution 策略收敛。
 
-## 8. 实验矩阵与状态
+## 7. 实验矩阵与状态
 
-本轮先按机制收敛顺序完成小规模验证：重复测量前后无污染、初始化边界、可观测性和 strict serial runner。全量 benchmark cost 需要等 native CUPTI + strict serial + SOL-style prepare path 合成到同一实现后再测。
+本轮先按机制收敛顺序完成小规模验证：重复测量前后无污染、可观测性和 strict serial runner。全量 benchmark cost 需要等 native CUPTI + strict serial + SOL-style prepare path 合成到同一实现后再测。
 
 | 优先级 | 实验 | 目标 | 对比 / 测例 | 主要指标 | 状态 |
 | --- | --- | --- | --- | --- | --- |
 | 1 | Prepare / attribution boundary | 验证 SOL-style prepare path 不污染 user activity sequence。 | `torch.add` single-kernel；GDN forward multi-kernel；检查 `prepare_iteration -> start_ts -> runner -> sync -> end_ts`。 | expected activity sequence 不包含 L2 flush；attributed calls == repeats；dropped records == 0。 | 已完成：single-kernel 和 7-kernel case 都是 timing 50/50、`dropped=0`，flush 全部在 attribution window 外。 |
 | 2 | Cache / address policy | 验证 SOL-style persisting L2 reset、L2 clear 和 shifting allocator 的稳定性。 | fixed address、3-clone、shifting allocator；current flush vs reset persisting L2 + `2 * L2_cache_size` clear。 | latency mean/std/p90、outlier、地址策略是否引入稳定偏差。 | 已完成小范围验证：三种 address policy 在 `torch.add` 上结果接近；SOL-style cache policy 不破坏 attribution。 |
-| 3 | Initialization boundary | 确认 first-call / warmup / discovery / timing 边界能吸收 lazy init。 | `first-call -> warmup -> discovery -> timing`。 | discovery 不进入 latency sample；timed repeat 中 sequence 稳定。 | 已完成基础验证：`torch.add` discovery 3/3、timing 10/10；正式 latency 只来自 discovery 后 timing。 |
-| 4 | Artifact / failure observability | 验证错误不会静默混入正式性能数据。 | 构造 CUPTI dropped、sequence mismatch、sample count mismatch、partial trace。 | 错误是否 fail closed；是否给出明确 failure reason。 | 已完成：四类故障都明确报错，没有静默生成 latency。 |
-| 5 | Full benchmark cost | 在正确性路径稳定后评估全量运行成本。 | strict serial + native CUPTI + SOL-style prepare path；fallback disabled；全量 `benchmarks/ops`。 | 全量耗时、单文件耗时分布、pass/fail files、GPU 干扰情况。 | 已完成一轮：wall time 2357.58s；无 GPU unavailable；5 个 file 因 native CUPTI attribution fail-closed。 |
+| 3 | Artifact / failure observability | 验证错误不会静默混入正式性能数据。 | 构造 CUPTI dropped、sequence mismatch、sample count mismatch、partial trace。 | 错误是否 fail closed；是否给出明确 failure reason。 | 已完成：四类故障都明确报错，没有静默生成 latency。 |
+| 4 | Full benchmark cost | 在正确性路径稳定后评估全量运行成本。 | strict serial + native CUPTI + SOL-style prepare path；fallback disabled；全量 `benchmarks/ops`。 | 全量耗时、单文件耗时分布、pass/fail files、GPU 干扰情况。 | 已完成一轮：wall time 2357.58s；无 GPU unavailable；5 个 file 因 native CUPTI attribution fail-closed。 |
 
 实验执行原则：
 
@@ -460,7 +388,7 @@ bench_moe_fused_moe.py           82.08s
 - 正式结论只来自同一 commit、同一 runner 镜像、同一 cache policy 下的对比。
 - 如果实验中发现新的污染源，先回到对应主需求章节修正文档，再继续后续实验。
 
-## 9. 细节索引
+## 8. 细节索引
 
 下面的表只作为实现排查索引，不作为正文主线。
 
@@ -470,7 +398,7 @@ bench_moe_fused_moe.py           82.08s
 | File 调度 | 严格串行 | 每个 benchmark file 一个 pytest child；默认 `--prewarm=4`。 | serialized GPU benchmarking。 | 增加 strict serial mode。 |
 | Collect/import | 严格串行 | child collect-only 可与当前 benchmark 重叠。 | 不通过 pytest prewarm。 | 检查 collect 是否 GPU-silent。 |
 | Teardown | 严格串行 | pytest rc 写回后 interpreter teardown 可后台继续。 | dedicated subprocess isolation。 | strict serial 下等待 child 完全退出。 |
-| Warmup | 无污染 / 初始化 | 10 次 warmup，最后同步。 | warmup 使用统一 prepare path。 | 统一 warmup/discovery/timing prepare。 |
+| Warmup | 无污染 / steady-state | 10 次 warmup，最后同步。 | warmup 使用统一 prepare path。 | 统一 warmup/discovery/timing prepare。 |
 | L2/cache | 无污染 | `cache.zero_()` 冲刷实际 L2 size buffer。 | reset persisting L2 + clear `2 * L2_cache_size` buffer。 | 评估 persisting L2 reset 和 buffer size。 |
 | Input/output | 无污染 | 3-clone pool，超过 1 GiB 跳过。 | shifting allocator，每轮不同 data pointer。 | 评估替换为 shifting allocator。 |
 | Discovery | 可观测 / 无污染 | Kineto 路径没有 native expected sequence discovery。 | discovery expected activity sequence/counts。 | 引入 native CUPTI discovery。 |
