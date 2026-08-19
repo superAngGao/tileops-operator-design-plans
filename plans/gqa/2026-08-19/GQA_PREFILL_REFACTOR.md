@@ -69,7 +69,7 @@ cache_seqlens: [B]                         # 每个序列在 cache 中的长度
 #### **Sliding Window**
 - `window_size_left: int`
 - `window_size_right: int`
-- 限制 attention 范围，用于长序列或 Mamba/RWKV 等架构
+- 限制 attention 范围，用于长序列场景
 
 #### **Position Encoding**
 - `pos_encoding_mode: 'none' | 'rope'`
@@ -265,7 +265,7 @@ class GroupedQueryAttentionFwdOp(Op):
 
 ### 3.2 重构后的 Dispatch（本次 PR）
 
-`GroupedQueryAttentionPrefillDenseFwdOp` 的实现（简化）：
+`GroupedQueryAttentionPrefillDenseFwdOp` 的实现结构：
 
 ```python
 class GroupedQueryAttentionPrefillDenseFwdOp(Op):
@@ -278,107 +278,114 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
                  window_size_left: int = -1,
                  window_size_right: int = -1,
                  dtype: Optional[torch.dtype] = None,
-                 pos_encoding_mode: str = 'none',   # 'none' or 'rope'
+                 pos_encoding_mode: str = 'none',
                  rotary_dim: Optional[int] = None,
                  rope_layout: str = 'neox',
                  rope_base: float = 10000.0,
                  kernel_map: Optional[Dict[str, Kernel]] = None,
                  tune: bool = False,
                  target: Target = None):
-        
-        # 验证配置参数
-        if pos_encoding_mode not in ("none", "rope"):
-            raise ValueError(f"pos_encoding_mode must be 'none' or 'rope'")
-        if rotary_dim is not None and pos_encoding_mode != "rope":
-            raise ValueError("rotary_dim requires pos_encoding_mode='rope'")
-        if pos_encoding_mode == "rope" and (rope_base <= 0 or not math.isfinite(rope_base)):
-            raise ValueError("rope_base must be finite and positive")
-        if sm_scale is not None and not math.isfinite(sm_scale):
-            raise ValueError(f"sm_scale must be finite")
+        """构造函数：保存配置参数，验证语义约束，选择 kernel 族"""
+        # 验证配置参数的语义约束
+        _validate_pos_encoding_config(pos_encoding_mode, rotary_dim, rope_base)
+        _validate_sm_scale(sm_scale)
         
         # 保存配置参数（不保存 shape）
         self.is_causal = is_causal
-        self.sm_scale = sm_scale  # 延迟到 forward 时根据 dim 计算
+        self.sm_scale = sm_scale
         self.softcap = _score_softcap(softcap)
         self.window_size_left = window_size_left
         self.window_size_right = window_size_right
         self.dtype = dtype
-        self.output_dtype = dtype
         self.pos_encoding_mode = pos_encoding_mode
-        self.fuse_rope = pos_encoding_mode == "rope"
         self.rotary_dim = rotary_dim
         self.rope_layout = rope_layout
         self.rope_base = rope_base
-        self.tune = tune
-        self.target = target
         
-        # 在构造时选择 kernel（通过 dispatch_kernel）
+        # Kernel 选择（基于配置，不依赖 shape）
         self.dispatch_kernel(kernel_map)
         
-        # 缓存：基于实际输入的 shape 和 device
-        self._rope_table_cache = {}  # key: (seq_len_kv, device, dtype)
+        # 缓存
+        self._rope_table_cache = {}
     
-    def forward(self, 
-                q: Tensor,  # [B, S_q, H, D]
-                k: Tensor,  # [B, S_kv, H_kv, D]
-                v: Tensor,  # [B, S_kv, H_kv, D]
-                q_scale: Optional[Tensor] = None,  # [B, H_kv] - FP8 only
-                k_scale: Optional[Tensor] = None,
-                v_scale: Optional[Tensor] = None) -> Tensor:
-        
-        # 从输入推断 shape
+    @property
+    def default_kernel_map(self) -> Dict[str, Kernel]:
+        """声明 Op 需要的 kernel 族"""
+        return {
+            "gqa_prefill_dense_fwd_kernel": GQAPrefillDenseFwdKernel,
+            "gqa_prefill_causal_fwd_kernel": GQAPrefillFwdWsPersistentCausalKernel,
+            "gqa_prefill_square_fwd_kernel": GQAFwdWsPersistentCausalKernel,
+        }
+    
+    def build(self,
+              q: torch.Tensor,
+              k: torch.Tensor,
+              v: torch.Tensor,
+              q_scale: Optional[torch.Tensor] = None,
+              k_scale: Optional[torch.Tensor] = None,
+              v_scale: Optional[torch.Tensor] = None) -> Kernel:
+        """根据输入的 shape 和 dtype 构建具体的 kernel 实例"""
         batch, seq_len, heads, dim = q.shape
         _, seq_len_kv, heads_kv, _ = k.shape
         
-        # 验证维度一致性
+        # 验证输入维度
         _validate_gqa_dims(heads, heads_kv, dim)
-        assert v.shape == k.shape, "k and v must have the same shape"
         
-        # FP8 验证
-        is_fp8 = q.dtype == torch.float8_e4m3fn
-        if is_fp8:
-            assert q_scale is not None and k_scale is not None and v_scale is not None, \
-                "FP8 mode requires q_scale, k_scale, v_scale"
-        else:
-            # 16-bit 模式拒绝 scales
-            assert q_scale is None and k_scale is None and v_scale is None, \
-                "16-bit mode does not accept scales"
+        # 选择 kernel（基于配置和输入特征）
+        call = AttentionCall(
+            batch=batch,
+            seq_len=seq_len,
+            seq_len_kv=seq_len_kv,
+            heads=heads,
+            heads_kv=heads_kv,
+            dim=dim,
+            is_causal=self.is_causal,
+            dtype=q.dtype,
+        )
         
-        # 计算 sm_scale（如果未指定）
-        sm_scale = self.sm_scale if self.sm_scale is not None else (1.0 / math.sqrt(dim))
+        # 返回具体 kernel 实例
+        return self._select_kernel(call)
+    
+    def __call__(self,
+                 q: Tensor,
+                 k: Tensor,
+                 v: Tensor,
+                 q_scale: Optional[Tensor] = None,
+                 k_scale: Optional[Tensor] = None,
+                 v_scale: Optional[Tensor] = None) -> Tensor:
+        """入口：验证输入，build kernel，执行"""
+        # 验证可选输入的语义约束
+        _validate_optional_inputs(q, q_scale, k_scale, v_scale)
         
-        # 获取或构建 kernel（基于 dtype 和 device）
-        kernel = self._get_kernel(q.dtype if self.dtype is None else self.dtype, 
-                                 device=q.device)
+        # 构建 kernel
+        kernel = self.build(q, k, v, q_scale, k_scale, v_scale)
         
-        # 调用 kernel（Dense kernel 直接接受 4D tensor）
-        if is_fp8:
-            out = kernel(q, k, v, q_scale, k_scale, v_scale, 
-                        sm_scale=sm_scale, is_causal=self.is_causal)
-        else:
-            out = kernel(q, k, v, sm_scale=sm_scale, is_causal=self.is_causal)
+        # 执行 kernel
+        out = kernel(q, k, v, q_scale, k_scale, v_scale)
         
-        # FP8 输入需要输出类型转换
-        if is_fp8 and self.output_dtype is not None:
-            out = out.to(self.output_dtype)
+        # 后处理（如 FP8 输出转换）
+        if self.dtype is not None and out.dtype != self.dtype:
+            out = out.to(self.dtype)
         
-        return out  # [B, S_q, H, D]
+        return out
 ```
 
-**改进：**
-- ✅ 构造函数不再需要 shape 参数（batch, heads, heads_kv, seq_len, seq_len_kv, dim）
-- ✅ Shape 从输入 tensor 动态推断
-- ✅ 同一个 Op 实例可以处理不同的 shape
-- ✅ 配置参数（is_causal, sm_scale, softcap 等）在构造时指定
-- ✅ 直接接受 4D dense tensor，无需 reshape
-- ✅ FP8 scales 是可选参数，带运行时验证
-- ✅ RoPE 在构造时确定，tables 按需生成和缓存
-- ✅ 支持 `seq_len != seq_len_kv`（如 KV cache prefill 场景）
+**关键设计点：**
 
-**注意：** 虽然 shape 不再在构造时固定，但：
-- Kernel 选择在构造时根据配置（is_causal, softcap 等）完成
-- RoPE tables 延迟生成并按 (seq_len_kv, device, dtype) 缓存
-- 支持 `torch.compile` 的动态 shape tracing
+1. **`__init__`**：保存配置参数（is_causal, sm_scale 等），验证语义约束，选择 kernel 族
+2. **`build`**：从输入推断 shape，根据 shape + 配置选择具体 kernel 实例
+3. **`__call__`**：验证输入 → build → 执行 → 后处理
+4. **`default_kernel_map`**：声明 Op 需要的 kernel 族（dispatch 用）
+
+**与重构前的对比：**
+- ❌ 重构前：构造时固定 shape，forward 时验证 shape 是否匹配
+- ✅ 重构后：构造时只保存配置，build 时从输入推断 shape
+
+**遵循的规则：**
+- ✅ 配置参数在构造时验证
+- ✅ Shape 相关的选择延迟到 build
+- ✅ 可选输入的语义约束在 `__call__` 中验证
+- ✅ Kernel 实例按需构建和缓存
 
 ### 3.3 功能 Dispatch 对比
 
