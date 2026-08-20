@@ -378,6 +378,11 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
 
 
 class DensePrefillBuiltinCallable:
+    # Bounded ownership cache. It is backend-callable state, not Op dispatch
+    # state: retained Kernel objects remain enumerable/autotunable and are never
+    # constructed for the first time during CUDA Graph capture.
+    specializations: OrderedDict[DenseSignature, DensePrefillKernel]
+
     def __call__(self, q, k, v, *scales):
         # 所有 shape 派生值均为本次调用的局部变量。
         batch, seq_len_q, heads, dim = q.shape
@@ -385,7 +390,7 @@ class DensePrefillBuiltinCallable:
         sm_scale = self.sm_scale if self.sm_scale is not None else dim**-0.5
         rotary_dim = self.rotary_dim if self.rotary_dim is not None else dim
 
-        # call 只是本次选择所需的临时 facts，不进入任何 cache。
+        # call 只是本次选择所需的临时 facts，不写回 Op。
         call = dense_selection_facts(
             batch=batch,
             seq_len_q=seq_len_q,
@@ -401,7 +406,11 @@ class DensePrefillBuiltinCallable:
             config=self.config,
         )
         role = select_kernel_key(DENSE_PREFILL_KEYS, call)
-        kernel = self.kernel_map[role](...)
+        signature = DenseSignature.from_call(call)
+        kernel = self.specializations.get(signature)
+        if kernel is None:
+            kernel = self.kernel_map[role](...)
+            self.specializations.put_bounded(signature, kernel)
         return kernel(q, k, v, *scales)
 ```
 
@@ -410,9 +419,11 @@ class DensePrefillBuiltinCallable:
 1. **`__init__`**：只保存构造期配置并安装 `kernel_map`，不读取设备、不保存 shape
 2. **Op cache**：缓存 target/backend callable；builtin 与外部 target 各自拥有具体实现策略
 3. **callable**：每次读取当前 tensor 的 shape/dtype，解析 shape-dependent 默认值并选择具体 kernel
+   - builtin callable 在内部完成选择，并有界持有已构造的 specialization
+   - external builder 仍按 TensorSpec signature 构造 callable；Op 在调用 builder 前把 `sm_scale`、输出 `dtype`、启用 RoPE 时的 `rotary_dim` 解析为该 signature 的确定值
 4. **`default_kernel_map`**：只维护 role → kernel class，不隐含优先级
 5. **selection**：沿用 #1896 的 `Kernel.applies/refusal` + `select_kernel_key` 契约；顺序不决定结果，重叠区域必须报歧义
-6. **缓存边界**：本轮不新增 shape/metadata cache；具体 kernel 编译复用由 TileLang cache 负责
+6. **缓存边界**：Op 只缓存 backend callable；callable 有界持有已经构造的具体 Kernel，使 `iter_kernels()`、`autotune()` 和 CUDA Graph 生命周期可见。TileLang cache 继续负责底层编译产物复用
 
 **与重构前的对比：**
 - ❌ 重构前：构造时固定 shape，forward 时验证 shape 是否匹配
@@ -424,8 +435,11 @@ class DensePrefillBuiltinCallable:
 - ✅ 可选输入的语义约束在公共 Op 边界验证
 - ✅ `batch/seq_len/dim/resolved_scale` 等 per-call facts 不写回 Op
 - ✅ callable 不重新探测 target/device
-- ✅ 不额外维护 shape → kernel 的 Python 缓存
-- ✅ 临时 selection facts 只用于一次选择，不写回 Op，也不是 metadata cache
+- ✅ MHA 等语义 wrapper 固定为 builtin composite；第三方替换发生在其 Dense GQA delegate，而不是要求后端重复注册 wrapper
+- ✅ RoPE operand cache 必须有界，长生命周期实例不能按每个 prompt 长度永久保留 GPU tables
+- ✅ Op 不维护 shape → kernel cache；有界 specialization ownership 属于 backend callable
+- ✅ 临时 selection facts 只用于一次选择，不写回 Op；只有稳定的 construction signature 进入 callable 的有界缓存
+- ✅ cache miss 的 Kernel 构造发生在正常调用/显式预热阶段；已构造 Kernel 可被枚举和预先 autotune，不能把首次调优推迟到 CUDA Graph capture
 
 ### 3.3 功能 Dispatch 对比
 
@@ -882,10 +896,14 @@ output = prefill_op(q, k_new, v_new, k_cache=k_cache, v_cache=v_cache)
 ```text
 Op cache:        target/config → backend callable
 每次调用:        shape/dtype → kernel role
+Callable cache:  bounded construction signature → concrete Kernel object
 TileLang cache:  concrete kernel config → compiled program
 ```
 
-本次不增加第四层 `shape → kernel object` Python cache，也不把最后一次调用的 shape 写回 Op。
+本次增加的是 callable 内部的**有界 Kernel ownership cache**，不是把最后一次
+调用的 shape 写回 Op，也不是缓存 Varlen/Paged 的运行期 metadata。它解决的是
+Kernel 生命周期问题：枚举、autotune、预热和 CUDA Graph capture 必须看到同一个
+已构造对象；TileLang cache 只复用编译产物，不能替代这层对象所有权。
 
 #### 对于 Dense Layout：无需 metadata cache
 
@@ -899,7 +917,7 @@ output = op(q, k, v)  # shape = [B, S, H, D]
 
 # Layer 2-80
 output = op(q, k, v)  # 相同 shape
-# → callable 再次执行轻量选择；TileLang 命中已有编译产物
+# → callable 再次执行轻量选择，并命中已构造的 Kernel object
 ```
 
 **开销分析**：
@@ -908,7 +926,8 @@ output = op(q, k, v)  # 相同 shape
 - ✅ 参数验证：每层都做，但开销很小（shape 检查）
 - ✅ Metadata：几乎没有（只有 shape）
 
-**结论**：对于 Dense layout，轻量 runtime dispatch + TileLang 编译缓存已经足够；暂不引入额外 metadata cache。
+**结论**：对于 Dense layout，轻量 runtime dispatch + 有界 Kernel ownership cache +
+TileLang 编译缓存足够；暂不引入 cu_seqlens、block table 等运行期 metadata cache。
 
 #### 对于 Varlen/Packed Layout：Kernel 缓存不够
 
