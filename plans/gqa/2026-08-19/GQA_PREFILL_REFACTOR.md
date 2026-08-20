@@ -422,6 +422,7 @@ class DensePrefillBuiltinCallable:
 3. **callable**：每次读取当前 tensor 的 shape/dtype，解析 shape-dependent 默认值并选择具体 kernel
    - builtin callable 在内部完成选择，并有界持有已构造的 specialization
    - external builder 仍按 TensorSpec signature 构造 callable；Op 在调用 builder 前把 `sm_scale`、输出 `dtype`、启用 RoPE 时的 `rotary_dim` 解析为该 signature 的确定值
+   - external signature table 使用独立的大容量有界 LRU；同 signature 的 miss/build 串行且 double-check，命中保持无锁。external callable 若显式实现 `autotune()`，则它本身是 tuning owner，不反射其内部对象
 4. **`default_kernel_map`**：只维护 role → kernel class，不隐含优先级
 5. **selection**：沿用 #1896 的 `Kernel.applies/refusal` + `select_kernel_key` 契约；顺序不决定结果，重叠区域必须报歧义
    - causal-WS 与 H200 square-persistent 都只声明自身的 positive profitability region。前者覆盖 rectangular、tail、odd-block 和 under-filled calls；后者覆盖 H200 上足够饱和的 aligned square。无法运行后者的高负载 aligned square 由 general Dense kernel 兜底，不通过 sibling negation 偷渡优先级
