@@ -439,7 +439,7 @@ class DensePrefillBuiltinCallable:
 - ✅ callable 不重新探测 target/device
 - ✅ MHA 等语义 wrapper 固定为 builtin composite，`forward` 被追踪到预先构造的 Dense GQA delegate；wrapper 不注册自己的 opaque compile node 或 external builder，第三方替换只发生在 delegate
 - ✅ RoPE operand cache 必须有界，长生命周期实例不能按每个 prompt 长度永久保留 GPU tables
-- ✅ RoPE tables 在 cache miss 上完成 readiness 后才发布；普通命中使用 `record_stream`，参与 CUDA Graph capture 的 tables 由 callable 单独强引用到其生命周期结束，不能因普通 memo 淘汰而释放
+- ✅ RoPE tables 在 cache miss 上完成 readiness 后才发布；普通命中使用 `record_stream`。参与 CUDA Graph capture 的 table generation 由 callable 单独强引用到其生命周期结束，并成为该 key 的 canonical generation；普通 memo 淘汰后仍复用它，不能释放或生成未固定的第二代指针
 - ✅ Op 不维护 shape → kernel cache；有界 specialization ownership 属于 backend callable
 - ✅ 临时 selection facts 只用于一次选择，不写回 Op；只有稳定的 construction signature 进入 callable 的有界缓存
 - ✅ cache miss 的 Kernel 构造发生在正常调用/显式预热阶段；已构造 Kernel 可被枚举和预先 autotune，不能把首次调优推迟到 CUDA Graph capture
