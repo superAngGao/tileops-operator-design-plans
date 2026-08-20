@@ -379,8 +379,9 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
 
 class DensePrefillBuiltinCallable:
     # Bounded ownership cache. It is backend-callable state, not Op dispatch
-    # state: retained Kernel objects remain enumerable/autotunable and are never
-    # constructed for the first time during CUDA Graph capture.
+    # state: retained Kernel objects remain enumerable/autotunable. After a
+    # same-signature warmup, CUDA Graph capture follows the lock-free cache-hit
+    # path and does not construct a Kernel.
     specializations: OrderedDict[DenseSignature, DensePrefillKernel]
 
     def __call__(self, q, k, v, *scales):
@@ -423,6 +424,7 @@ class DensePrefillBuiltinCallable:
    - external builder 仍按 TensorSpec signature 构造 callable；Op 在调用 builder 前把 `sm_scale`、输出 `dtype`、启用 RoPE 时的 `rotary_dim` 解析为该 signature 的确定值
 4. **`default_kernel_map`**：只维护 role → kernel class，不隐含优先级
 5. **selection**：沿用 #1896 的 `Kernel.applies/refusal` + `select_kernel_key` 契约；顺序不决定结果，重叠区域必须报歧义
+   - 当前 causal-WS 与 H200 square-persistent 两个历史 specialization 仍通过 sibling exclusion 划分重叠能力区。这不是本次两级 dispatch 的目标形态，也不应伪装成 positive region；后续应由规范作者确认是合并为一个 causal schedule family，还是扩展 implementation-selection 契约。本 PR 保留原行为，不借 Op 重构顺带改写该边界
 6. **缓存边界**：Op 只缓存 backend callable；callable 有界持有已经构造的具体 Kernel，使 `iter_kernels()`、`autotune()` 和 CUDA Graph 生命周期可见。TileLang cache 继续负责底层编译产物复用
 
 **与重构前的对比：**
@@ -435,7 +437,7 @@ class DensePrefillBuiltinCallable:
 - ✅ 可选输入的语义约束在公共 Op 边界验证
 - ✅ `batch/seq_len/dim/resolved_scale` 等 per-call facts 不写回 Op
 - ✅ callable 不重新探测 target/device
-- ✅ MHA 等语义 wrapper 固定为 builtin composite；第三方替换发生在其 Dense GQA delegate，而不是要求后端重复注册 wrapper
+- ✅ MHA 等语义 wrapper 固定为 builtin composite，`forward` 被追踪到预先构造的 Dense GQA delegate；wrapper 不注册自己的 opaque compile node 或 external builder，第三方替换只发生在 delegate
 - ✅ RoPE operand cache 必须有界，长生命周期实例不能按每个 prompt 长度永久保留 GPU tables
 - ✅ Op 不维护 shape → kernel cache；有界 specialization ownership 属于 backend callable
 - ✅ 临时 selection facts 只用于一次选择，不写回 Op；只有稳定的 construction signature 进入 callable 的有界缓存
