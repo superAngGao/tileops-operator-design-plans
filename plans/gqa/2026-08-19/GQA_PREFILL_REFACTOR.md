@@ -424,7 +424,7 @@ class DensePrefillBuiltinCallable:
    - external builder 仍按 TensorSpec signature 构造 callable；Op 在调用 builder 前把 `sm_scale`、输出 `dtype`、启用 RoPE 时的 `rotary_dim` 解析为该 signature 的确定值
 4. **`default_kernel_map`**：只维护 role → kernel class，不隐含优先级
 5. **selection**：沿用 #1896 的 `Kernel.applies/refusal` + `select_kernel_key` 契约；顺序不决定结果，重叠区域必须报歧义
-   - 当前 causal-WS 与 H200 square-persistent 两个历史 specialization 仍通过 sibling exclusion 划分重叠能力区。这不是本次两级 dispatch 的目标形态，也不应伪装成 positive region；后续应由规范作者确认是合并为一个 causal schedule family，还是扩展 implementation-selection 契约。本 PR 保留原行为，不借 Op 重构顺带改写该边界
+   - causal-WS 与 H200 square-persistent 都只声明自身的 positive profitability region。前者覆盖 rectangular、tail、odd-block 和 under-filled calls；后者覆盖 H200 上足够饱和的 aligned square。无法运行后者的高负载 aligned square 由 general Dense kernel 兜底，不通过 sibling negation 偷渡优先级
 6. **缓存边界**：Op 只缓存 backend callable；callable 有界持有已经构造的具体 Kernel，使 `iter_kernels()`、`autotune()` 和 CUDA Graph 生命周期可见。TileLang cache 继续负责底层编译产物复用
 
 **与重构前的对比：**
