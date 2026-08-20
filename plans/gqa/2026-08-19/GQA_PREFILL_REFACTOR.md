@@ -1,5 +1,30 @@
 # GQA Prefill 重构详解
 
+> 2026-08-20 决策更新：本节优先于文档中与之冲突的早期草案。
+
+## Dense 两层 dispatch 的最终边界
+
+Dense Op 实例只保存构造期语义配置，不保存任何一次调用的 shape。Op 层先按 target 选择并缓存 backend callable；该 callable 每次调用读取当前 `q/k/v` 的 shape/dtype，再选择并调用具体 Kernel。callable 不再读 device 选择 backend，也不把 per-call shape 写回 Op。
+
+RoPE 采用 caller-owned ABI：
+
+```python
+op = GroupedQueryAttentionPrefillDenseFwdOp(
+    is_causal=True,
+    pos_encoding_mode="rope",
+    rotary_dim=64,
+    rope_layout="interleaved",
+)
+out = op(q, k, v, rope_cos=cos, rope_sin=sin)
+```
+
+- `rope_cos` / `rope_sin` 是 manifest 中成对出现的 `optional: true` tensor inputs。
+- `pos_encoding_mode` / `rotary_dim` / `rope_layout` 只声明如何解释表；Op/callable 不生成、不缓存 RoPE GPU tensor。
+- table 的分配、stream readiness 和 CUDA Graph 指针生命周期归调用方管理，与 Q/K/V 相同。
+- 未启用 RoPE 时两张表必须同时省略；启用时必须同时提供。
+
+本轮不修改 generic external signature cache 的 LRU/并发/autotune 政策，不修改 MHA composite compile boundary，不重新定义 causal/square specialization region。这些不是 Dense 两层 dispatch 成立的前提。builtin callable 仅保留必要的具体 Kernel ownership，使已构造 Kernel 可被 `iter_kernels()` 和 `autotune()` 看到；TileLang cache 继续负责编译产物复用。
+
 ## 一、GQA 算子库的功能需求
 
 对于一个完整的 Attention 算子库，GQA (Grouped Query Attention) 需要支持多个维度的变体：
@@ -299,7 +324,7 @@ kernel_map[role] → 具体 kernel
 
 ```python
 class GroupedQueryAttentionPrefillDenseFwdOp(Op):
-    """Shape-agnostic BSHD GQA prefill with constructor-owned position encoding."""
+    """Shape-agnostic BSHD GQA prefill with caller-owned optional RoPE tables."""
     
     def __init__(self,
                  is_causal: bool = True,
@@ -311,13 +336,12 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
                  pos_encoding_mode: str = 'none',
                  rotary_dim: Optional[int] = None,
                  rope_layout: str = 'neox',
-                 rope_base: float = 10000.0,
                  kernel_map: Optional[Dict[str, Kernel]] = None,
                  tune: bool = False,
                  target: Target = None):
         """保存配置参数并安装 kernel_map；不保存任何输入 shape。"""
         # 验证配置参数的语义约束
-        _validate_pos_encoding_config(pos_encoding_mode, rotary_dim, rope_base)
+        _validate_pos_encoding_config(pos_encoding_mode, rotary_dim)
         _validate_sm_scale(sm_scale)
         
         # 保存配置参数（不保存 shape）
@@ -330,7 +354,6 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
         self.pos_encoding_mode = pos_encoding_mode
         self.rotary_dim = rotary_dim
         self.rope_layout = rope_layout
-        self.rope_base = rope_base
         
         # 只安装 role -> kernel class 映射，不选择具体 kernel
         self.dispatch_kernel(kernel_map)
@@ -356,14 +379,21 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
             pos_encoding_mode=self.pos_encoding_mode,
             rotary_dim=self.rotary_dim,
             rope_layout=self.rope_layout,
-            rope_base=self.rope_base,
             output_dtype=self.dtype,
             tune=self.tune,
         )
 
-    def _eager_forward(self, q, k, v, q_scale=None, k_scale=None, v_scale=None):
-        _validate_dense_inputs(q, k, v, q_scale, k_scale, v_scale)
-        inputs = _normalize_dense_inputs(q, k, v, q_scale, k_scale, v_scale)
+    def _eager_forward(
+        self, q, k, v,
+        q_scale=None, k_scale=None, v_scale=None,
+        rope_cos=None, rope_sin=None,
+    ):
+        _validate_dense_inputs(
+            q, k, v, q_scale, k_scale, v_scale, rope_cos, rope_sin
+        )
+        inputs = _normalize_dense_inputs(
+            q, k, v, q_scale, k_scale, v_scale, rope_cos, rope_sin
+        )
 
         # Cache 中保存 backend callable，而不是第一次 shape 的 kernel。
         callable = self.get_or_build_kernel(
@@ -384,7 +414,7 @@ class DensePrefillBuiltinCallable:
     # path and does not construct a Kernel.
     specializations: OrderedDict[DenseSignature, DensePrefillKernel]
 
-    def __call__(self, q, k, v, *scales):
+    def __call__(self, q, k, v, *optional_inputs):
         # 所有 shape 派生值均为本次调用的局部变量。
         batch, seq_len_q, heads, dim = q.shape
         _, seq_len_kv, heads_kv, _ = k.shape
@@ -412,7 +442,7 @@ class DensePrefillBuiltinCallable:
         if kernel is None:
             kernel = self.kernel_map[role](...)
             self.specializations.put_bounded(signature, kernel)
-        return kernel(q, k, v, *scales)
+        return kernel(q, k, v, *optional_inputs)
 ```
 
 **关键设计点：**
