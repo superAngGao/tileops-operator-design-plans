@@ -905,7 +905,7 @@ TileLang cache:  concrete kernel config → compiled program
 Kernel 生命周期问题：枚举、autotune、预热和 CUDA Graph capture 必须看到同一个
 已构造对象；TileLang cache 只复用编译产物，不能替代这层对象所有权。
 
-#### 对于 Dense Layout：无需 metadata cache
+#### 对于 Dense Layout：无需运行期 metadata cache
 
 ```python
 # Dense GQA Prefill
