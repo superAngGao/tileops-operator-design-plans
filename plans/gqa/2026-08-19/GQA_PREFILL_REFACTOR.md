@@ -452,10 +452,8 @@ class DensePrefillBuiltinCallable:
 3. **callable**：每次读取当前 tensor 的 shape/dtype，解析 shape-dependent 默认值并选择具体 kernel
    - builtin callable 在内部完成选择，并有界持有已构造的 specialization
    - external builder 仍按 TensorSpec signature 构造 callable；Op 在调用 builder 前把 `sm_scale`、输出 `dtype`、启用 RoPE 时的 `rotary_dim` 解析为该 signature 的确定值
-   - external signature table 使用独立的大容量有界 LRU；同 signature 的 miss/build 串行且 double-check，命中保持无锁。external callable 若显式实现 `autotune()`，则它本身是 tuning owner，不反射其内部对象
 4. **`default_kernel_map`**：只维护 role → kernel class，不隐含优先级
 5. **selection**：沿用 #1896 的 `Kernel.applies/refusal` + `select_kernel_key` 契约；顺序不决定结果，重叠区域必须报歧义
-   - causal-WS 与 H200 square-persistent 都只声明自身的 positive profitability region。前者覆盖 rectangular、tail、odd-block 和 under-filled calls；后者覆盖 H200 上足够饱和的 aligned square。无法运行后者的高负载 aligned square 由 general Dense kernel 兜底，不通过 sibling negation 偷渡优先级
 6. **缓存边界**：Op 只缓存 backend callable；callable 有界持有已经构造的具体 Kernel，使 `iter_kernels()`、`autotune()` 和 CUDA Graph 生命周期可见。TileLang cache 继续负责底层编译产物复用
 
 **与重构前的对比：**
@@ -468,9 +466,7 @@ class DensePrefillBuiltinCallable:
 - ✅ 可选输入的语义约束在公共 Op 边界验证
 - ✅ `batch/seq_len/dim/resolved_scale` 等 per-call facts 不写回 Op
 - ✅ callable 不重新探测 target/device
-- ✅ MHA 等语义 wrapper 固定为 builtin composite，`forward` 被追踪到预先构造的 Dense GQA delegate；wrapper 不注册自己的 opaque compile node 或 external builder，第三方替换只发生在 delegate
-- ✅ RoPE operand cache 必须有界，长生命周期实例不能按每个 prompt 长度永久保留 GPU tables
-- ✅ RoPE tables 在 cache miss 上完成 readiness 后才发布；普通命中使用 `record_stream`。参与 CUDA Graph capture 的 table generation 由 callable 单独强引用到其生命周期结束，并成为该 key 的 canonical generation；普通 memo 淘汰后仍复用它，不能释放或生成未固定的第二代指针
+- ✅ `rope_cos` / `rope_sin` 是 caller-owned optional tensors；Op/callable 不生成、不缓存，也不接管其 stream/CUDA Graph 生命周期
 - ✅ Op 不维护 shape → kernel cache；有界 specialization ownership 属于 backend callable
 - ✅ 临时 selection facts 只用于一次选择，不写回 Op；只有稳定的 construction signature 进入 callable 的有界缓存
 - ✅ cache miss 的 Kernel 构造发生在正常调用/显式预热阶段；已构造 Kernel 可被枚举和预先 autotune，不能把首次调优推迟到 CUDA Graph capture
@@ -482,7 +478,7 @@ class DensePrefillBuiltinCallable:
 | **输入格式** | Dense → Packed 转换 | 直接接受 Dense |
 | **Shape 约束** | 构造时固定 batch/seq_len | 构造时无 shape，forward 时推断 |
 | **FP8 scales** | 强制必需 | 可选 + 运行时验证 |
-| **RoPE** | 运行时判断 | 构造时确定，tables 延迟生成 |
+| **RoPE** | 运行时判断 | 构造时确定解释方式；tables 由调用方作为 optional tensors 提供 |
 | **Kernel 选择** | 部分在构造时 | target callable 缓存；具体 kernel 按每次调用的 shape/dtype 选择 |
 | **S_q ≠ S_kv** | 不支持 | ✅ 支持 |
 | **动态 shape** | 不支持（需创建新实例）| ✅ 支持（同实例处理多种 shape）|
