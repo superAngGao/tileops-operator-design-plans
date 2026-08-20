@@ -100,10 +100,21 @@ cache_seqlens: [B]                         # 每个序列在 cache 中的长度
 
 每个 Op 通过参数支持 causal/non-causal、sliding window、RoPE、FP8 等功能。
 
-**业界参考：** FlashInfer 也采用了相同的拆分策略，按 layout 提供了 3 个独立的 API：
-- `single_prefill_with_kv_cache()` - Dense/Single request
-- `BatchPrefillWithRaggedKVCacheWrapper` - Ragged/Varlen
-- `BatchPrefillWithPagedKVCacheWrapper` - Paged
+**采用这种拆分的考虑：**
+- Varlen 和 Paged 两种变体可能需要通过 metadata 缓存管理来减少 CPU 端的计算量（详见[八、待讨论：Metadata 缓存机制](#八待讨论metadata-缓存机制)）
+- 如果未来需要进一步收敛接口，这种拆分方式的重构成本相对较小
+- 每个 layout 有独立的优化空间和性能特征
+
+**业界参考：** FlashInfer 采用了类似的拆分策略：
+- **用户接口层**：提供统一的函数式 API（如 `single_prefill_with_kv_cache()`），layout 作为参数传入
+- **Wrapper 层**：按 layout 拆分为独立的 Wrapper 类
+  - `BatchPrefillWithRaggedKVCacheWrapper` - Ragged/Varlen
+  - `BatchPrefillWithPagedKVCacheWrapper` - Paged
+- Wrapper 负责 metadata 预处理和缓存（详见[八、待讨论：Metadata 缓存机制](#八待讨论metadata-缓存机制)）
+
+**TileOps 与 FlashInfer 的设计差异：**
+- FlashInfer：用户直接调用函数，Wrapper 用于优化 batch 场景的 metadata 缓存
+- TileOps：Op 类是一等公民，每个 layout 是独立的 Op 实例
 
 ---
 
@@ -825,3 +836,288 @@ output = prefill_op(q, k_new, v_new, k_cache=k_cache, v_cache=v_cache)
 **长期（根据讨论结果）：**
 - 如果决定集成：重构所有 prefill Ops，统一支持 append
 - 如果决定分离：文档中明确最佳实践，参考 FlashInfer 的设计
+
+---
+
+## 八、待讨论：Metadata 缓存机制
+
+### 8.1 问题背景
+
+#### TileOps 当前的 Kernel 缓存机制
+
+TileOps Op 基类提供了 kernel 缓存机制（`Op.get_or_build_kernel`）：
+
+```python
+class Op:
+    _kernel_roles: dict[str, dict[Hashable, object]]  # {role: {cache_key: kernel}}
+    
+    def _cache_key(self, *input_shapes: tuple[int, ...]) -> Hashable:
+        """从输入 shape 计算 cache key（排除静态维度）"""
+        return tuple(
+            s for i, shape in enumerate(input_shapes)
+            for axis, s in enumerate(shape)
+            if (i, axis) not in self._static_axes
+        )
+    
+    def get_or_build_kernel(self, role: str, factory: Callable, *input_shapes):
+        """基于 shape 缓存编译好的 kernel"""
+        key = self._cache_key(*input_shapes)
+        if key not in self._kernel_roles.setdefault(role, {}):
+            self._kernel_roles[role][key] = factory()
+        return self._kernel_roles[role][key]
+```
+
+**Kernel 缓存解决的问题**：
+- 避免重复编译 CUDA/Triton kernel
+- 避免重复的 kernel 选择逻辑
+- Cache key 基于输入 tensor 的 **shape**（非静态维度）
+
+#### 对于 Dense Layout：Kernel 缓存足够
+
+```python
+# Dense GQA Prefill
+op = GroupedQueryAttentionPrefillDenseFwdOp(is_causal=True)
+
+# Layer 1
+output = op(q, k, v)  # shape = [B, S, H, D]
+# → 选择并编译 kernel → 缓存
+
+# Layer 2-80
+output = op(q, k, v)  # 相同 shape
+# → 命中缓存，直接使用编译好的 kernel
+```
+
+**开销分析**：
+- ✅ Kernel 编译：只做一次
+- ✅ Kernel 选择：只做一次
+- ✅ 参数验证：每层都做，但开销很小（shape 检查）
+- ✅ Metadata：几乎没有（只有 shape）
+
+**结论**：对于 Dense layout，当前的 kernel 缓存已经提供了足够的优化。
+
+#### 对于 Varlen/Packed Layout：Kernel 缓存不够
+
+```python
+# Varlen GQA Prefill
+op = GroupedQueryAttentionPrefillPackedFwdOp(is_causal=True)
+
+# Layer 1
+output = op(q, k, v, 
+            cu_seqlens_q, cu_seqlens_kv,      # [B+1] 累积索引
+            max_seqlen_q=128, max_seqlen_kv=256)
+# → 选择并编译 kernel → 缓存 kernel
+# → 验证 cu_seqlens 的一致性
+# → 传输 cu_seqlens 到 GPU（如果在 CPU）
+# → Kernel 内部解析 cu_seqlens
+
+# Layer 2-80（相同 batch）
+output = op(q, k, v,
+            cu_seqlens_q, cu_seqlens_kv,      # 重复传递
+            max_seqlen_q=128, max_seqlen_kv=256)
+# → 命中 kernel 缓存 ✅
+# → 但每层都要：
+#    - 重复验证 cu_seqlens ❌
+#    - 重复传输到 GPU（如果需要）❌
+#    - Kernel 内部重复解析 ❌
+```
+
+**开销分析**：
+- ✅ Kernel 编译：只做一次（kernel 缓存有效）
+- ✅ Kernel 选择：只做一次（kernel 缓存有效）
+- ❌ Metadata 验证：每层都做（80 次）
+- ❌ Metadata 传输：每层都可能发生（80 次）
+- ❌ Metadata 解析：kernel 内部每次都解析（80 次）
+
+**结论**：对于 Varlen/Packed layout，kernel 缓存解决了编译问题，但 **metadata 处理开销仍然存在**。
+
+#### 对于 Paged Layout：问题更严重
+
+Paged layout 的 metadata 更复杂：
+- `page_table: [B, max_blocks]` - 逻辑到物理 page 的映射
+- `cu_seqlens: [B+1]` - 累积序列长度
+- `kv_indptr` - Page 索引映射
+- Address translation logic
+
+每层都要传输、验证、解析这些 metadata，开销更大。
+
+### 8.2 业界方案：FlashInfer 的 Metadata 缓存
+
+FlashInfer 通过 **Wrapper 类**提供显式的 metadata 缓存：
+
+```python
+# 创建 wrapper
+wrapper = BatchPrefillWithPagedKVCacheWrapper(...)
+
+# 一次性预处理 metadata 并缓存
+wrapper.begin_forward(
+    kv_indptr=indptr,
+    kv_page_indices=page_indices,
+    kv_last_page_lens=last_lens
+)
+
+# 多层 attention 共享缓存的 metadata
+for layer in transformer_layers:
+    output = wrapper.forward(q)  # 不需要重复传递 metadata
+
+# 清理缓存
+wrapper.end_forward()
+```
+
+**优化效果**：
+- ✅ Kernel 编译：只做一次
+- ✅ Metadata 验证和传输：只做一次
+- ✅ Metadata 预处理：只做一次
+- 多层 transformer 的 metadata 开销从 O(layers) 降到 O(1)
+
+**代价**：
+- 用户需要手动管理 `begin_forward` / `end_forward`
+- 容易忘记调用，导致错误
+
+### 8.3 待讨论议题
+
+#### 议题 1：是否支持 Metadata 缓存？
+
+**支持的理由**：
+- 优化多层 transformer 的 metadata 处理开销（特别是 Varlen/Paged）
+- 与 kernel 缓存互补，形成完整的优化链
+- 业界实践（FlashInfer）证明了有效性
+
+**不支持的理由**：
+- 增加 API 复杂度
+- Dense layout 不需要（已经够快）
+- 实现和维护成本
+- TileOps 设计哲学：Op 应该尽量无状态
+
+**需要讨论**：
+- 优先级如何？是否在本次 PR 考虑？
+- 是否只为 Varlen/Paged 提供，Dense 不需要？
+
+#### 议题 2：如果支持，采用哪种方案？
+
+**方案 A：显式缓存（手动管理）**
+
+```python
+class GroupedQueryAttentionPrefillPackedFwdOp(Op):
+    def prepare_batch(self, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
+        """显式准备并缓存 batch metadata"""
+        self._cached_metadata = self._preprocess_metadata(
+            cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv
+        )
+    
+    def __call__(self, q, k, v):
+        """使用缓存的 metadata"""
+        if self._cached_metadata is None:
+            raise RuntimeError("Must call prepare_batch() before forward")
+        kernel = self.get_or_build_kernel("fwd", ...)
+        return kernel(q, k, v, self._cached_metadata)
+    
+    def clear_batch(self):
+        """清理缓存"""
+        self._cached_metadata = None
+
+
+# 用户代码
+op = GroupedQueryAttentionPrefillPackedFwdOp(is_causal=True)
+
+op.prepare_batch(cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+for layer in transformer_layers:
+    output = op(q, k, v)  # 使用缓存的 metadata
+op.clear_batch()
+```
+
+**优点**：
+- 性能可预测，生命周期明确
+- 类似 FlashInfer 的 `begin_forward()` / `end_forward()`
+- 无内存泄漏风险
+
+**缺点**：
+- 用户需要记住调用 `prepare_batch()` / `clear_batch()`
+- 不符合 PyTorch 的直觉
+- API 相对繁琐
+
+---
+
+**方案 B：Context Manager（显式缓存 + 自动清理）**
+
+```python
+class GroupedQueryAttentionPrefillPackedFwdOp(Op):
+    @contextmanager
+    def batch_scope(self, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
+        """Context manager for batch metadata caching"""
+        self._cached_metadata = self._preprocess_metadata(
+            cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv
+        )
+        try:
+            yield
+        finally:
+            self._cached_metadata = None
+    
+    def __call__(self, q, k, v, 
+                 cu_seqlens_q=None, cu_seqlens_kv=None,
+                 max_seqlen_q=None, max_seqlen_kv=None):
+        """支持两种模式：带 metadata 或使用缓存"""
+        if self._cached_metadata is None:
+            # 模式 1：单次调用，每次传 metadata
+            if cu_seqlens_q is None:
+                raise ValueError("Must provide cu_seqlens_q or use batch_scope()")
+            metadata = self._preprocess_metadata(
+                cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv
+            )
+        else:
+            # 模式 2：使用缓存的 metadata
+            metadata = self._cached_metadata
+        
+        kernel = self.get_or_build_kernel("fwd", ...)
+        return kernel(q, k, v, metadata)
+
+
+# 用户代码 - 模式 1：单次调用（无优化）
+op = GroupedQueryAttentionPrefillPackedFwdOp(is_causal=True)
+output = op(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+
+# 用户代码 - 模式 2：批量优化（多层 transformer）
+with op.batch_scope(cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
+    for layer in transformer_layers:
+        output = op(q, k, v)  # metadata 已缓存
+# 自动清理
+```
+
+**优点**：
+- 两种模式并存：简单场景直接调用，优化场景用 context manager
+- 自动清理（Pythonic）
+- 向后兼容：不用优化时 API 不变
+- 生命周期清晰
+
+**缺点**：
+- API 稍复杂（两种调用模式）
+- 需要文档明确说明使用场景
+
+---
+
+**方案对比**：
+
+| 维度 | 方案 A（手动管理）| 方案 B（Context Manager）|
+|------|------------------|-------------------------|
+| **易用性** | 需要记住 prepare/clear | Context manager 自动清理 |
+| **灵活性** | 只支持缓存模式 | 支持有/无缓存两种模式 |
+| **向后兼容** | 不兼容（必须 prepare）| 兼容（可选优化）|
+| **实现复杂度** | 低 | 中等 |
+| **风险** | 用户可能忘记调用 | API 有两种模式，需要文档说明 |
+
+### 8.4 当前建议
+
+**短期（本次 PR #1926）：**
+- ❌ **不实现** metadata 缓存
+- ✅ 保持当前的 API 设计（每次传递 metadata）
+- ✅ 在文档中说明这是已知的优化空间
+
+**中期（团队讨论后）：**
+- 讨论是否需要 metadata 缓存
+- 如果需要，选择方案 A 或方案 B
+- 评估实现成本和收益
+
+**长期（如果决定支持）：**
+- **推荐方案 B（Context Manager）**
+  - 原因：向后兼容 + 自动清理 + 灵活性
+- 为 Varlen 和 Paged Op 实现 metadata 缓存
+- Dense Op 不需要（已经足够高效）
