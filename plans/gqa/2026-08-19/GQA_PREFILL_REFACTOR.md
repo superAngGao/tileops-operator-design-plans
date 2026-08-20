@@ -197,11 +197,12 @@ shape_rules:
 - RoPE 的启用方式不统一
 - 有的通过动态判断 `position_ids` 是否为 None
 - 有的通过 `backend` 参数隐式控制
-- Kernel 选择在运行时进行，增加开销
+- Kernel 选择分散在 Op 与 kernel 包装层，职责和覆盖范围不清晰
 
 **期望：**
 - 在 Op 构造时通过 `pos_encoding_mode` 显式声明：`'none'` 或 `'rope'`
-- Kernel 选择在构造时完成，减少运行时分支
+- Op 首次调用时选择并缓存 target 对应的 callable
+- callable 每次调用根据当前 tensor 的 shape/dtype 选择具体 kernel；不把 shape 固化在 Op 上
 
 #### 问题 4：命名混乱，职责不清
 
@@ -276,7 +277,25 @@ class GroupedQueryAttentionFwdOp(Op):
 
 ### 3.2 重构后的 Dispatch（本次 PR）
 
-`GroupedQueryAttentionPrefillDenseFwdOp` 的实现结构：
+`GroupedQueryAttentionPrefillDenseFwdOp` 使用两级 dispatch：
+
+```text
+Op 构造期配置
+    ↓
+target 解析并缓存 backend callable
+    ↓
+每次调用 callable
+    ↓
+读取当前 q/k/v 的 shape、dtype
+    ↓
+按 `Kernel.applies/refusal` 选择唯一 Dense kernel role
+    ↓
+kernel_map[role] → 具体 kernel
+```
+
+第一级只决定由哪个 target/backend 提供实现；第二级由该 backend 的 callable 自己完成 shape 相关的 kernel dispatch。Dense callable 不读取 device 来再次选择 backend，device/target 已经在上一级确定。
+
+内置实现的结构如下：
 
 ```python
 class GroupedQueryAttentionPrefillDenseFwdOp(Op):
@@ -296,7 +315,7 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
                  kernel_map: Optional[Dict[str, Kernel]] = None,
                  tune: bool = False,
                  target: Target = None):
-        """构造函数：保存配置参数，验证语义约束，选择 kernel 族"""
+        """保存配置参数并安装 kernel_map；不保存任何输入 shape。"""
         # 验证配置参数的语义约束
         _validate_pos_encoding_config(pos_encoding_mode, rotary_dim, rope_base)
         _validate_sm_scale(sm_scale)
@@ -313,11 +332,8 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
         self.rope_layout = rope_layout
         self.rope_base = rope_base
         
-        # Kernel 选择（基于配置，不依赖 shape）
+        # 只安装 role -> kernel class 映射，不选择具体 kernel
         self.dispatch_kernel(kernel_map)
-        
-        # 缓存
-        self._rope_table_cache = {}
     
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
@@ -328,75 +344,88 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
             "gqa_prefill_square_fwd_kernel": GQAFwdWsPersistentCausalKernel,
         }
     
-    def build(self,
-              q: torch.Tensor,
-              k: torch.Tensor,
-              v: torch.Tensor,
-              q_scale: Optional[torch.Tensor] = None,
-              k_scale: Optional[torch.Tensor] = None,
-              v_scale: Optional[torch.Tensor] = None) -> Kernel:
-        """根据输入的 shape 和 dtype 构建具体的 kernel 实例"""
-        batch, seq_len, heads, dim = q.shape
+    def _build_builtin_callable(self, target_facts):
+        return DensePrefillBuiltinCallable(
+            kernel_map=self.kernel_map,
+            target_facts=target_facts,
+            is_causal=self.is_causal,
+            sm_scale=self.sm_scale,
+            softcap=self.softcap,
+            window_size_left=self.window_size_left,
+            window_size_right=self.window_size_right,
+            pos_encoding_mode=self.pos_encoding_mode,
+            rotary_dim=self.rotary_dim,
+            rope_layout=self.rope_layout,
+            rope_base=self.rope_base,
+            output_dtype=self.dtype,
+            tune=self.tune,
+        )
+
+    def _eager_forward(self, q, k, v, q_scale=None, k_scale=None, v_scale=None):
+        _validate_dense_inputs(q, k, v, q_scale, k_scale, v_scale)
+        inputs = _normalize_dense_inputs(q, k, v, q_scale, k_scale, v_scale)
+
+        # Cache 中保存 backend callable，而不是第一次 shape 的 kernel。
+        callable = self.get_or_build_kernel(
+            "gqa_prefill_dense",
+            inputs,
+            key=(q.device, q.dtype, self.dtype),
+            build=lambda: self._build_builtin_callable(
+                resolve_builtin_target_facts(q.device)
+            ),
+        )
+        return callable(*inputs)
+
+
+class DensePrefillBuiltinCallable:
+    def __call__(self, q, k, v, *scales):
+        # 所有 shape 派生值均为本次调用的局部变量。
+        batch, seq_len_q, heads, dim = q.shape
         _, seq_len_kv, heads_kv, _ = k.shape
-        
-        # 验证输入维度
-        _validate_gqa_dims(heads, heads_kv, dim)
-        
-        # 选择 kernel（基于配置和输入特征）
-        call = AttentionCall(
+        sm_scale = self.sm_scale if self.sm_scale is not None else dim**-0.5
+        rotary_dim = self.rotary_dim if self.rotary_dim is not None else dim
+
+        # call 只是本次选择所需的临时 facts，不进入任何 cache。
+        call = dense_selection_facts(
             batch=batch,
-            seq_len=seq_len,
+            seq_len_q=seq_len_q,
             seq_len_kv=seq_len_kv,
             heads=heads,
             heads_kv=heads_kv,
             dim=dim,
-            is_causal=self.is_causal,
-            dtype=q.dtype,
+            input_dtype=q.dtype,
+            output_dtype=self.output_dtype or q.dtype,
+            sm_scale=sm_scale,
+            rotary_dim=rotary_dim,
+            target_facts=self.target_facts,
+            config=self.config,
         )
-        
-        # 返回具体 kernel 实例
-        return self._select_kernel(call)
-    
-    def __call__(self,
-                 q: Tensor,
-                 k: Tensor,
-                 v: Tensor,
-                 q_scale: Optional[Tensor] = None,
-                 k_scale: Optional[Tensor] = None,
-                 v_scale: Optional[Tensor] = None) -> Tensor:
-        """入口：验证输入，build kernel，执行"""
-        # 验证可选输入的语义约束
-        _validate_optional_inputs(q, q_scale, k_scale, v_scale)
-        
-        # 构建 kernel
-        kernel = self.build(q, k, v, q_scale, k_scale, v_scale)
-        
-        # 执行 kernel
-        out = kernel(q, k, v, q_scale, k_scale, v_scale)
-        
-        # 后处理（如 FP8 输出转换）
-        if self.dtype is not None and out.dtype != self.dtype:
-            out = out.to(self.dtype)
-        
-        return out
+        role = select_kernel_key(DENSE_PREFILL_KEYS, call)
+        kernel = self.kernel_map[role](...)
+        return kernel(q, k, v, *scales)
 ```
 
 **关键设计点：**
 
-1. **`__init__`**：保存配置参数（is_causal, sm_scale 等），验证语义约束，选择 kernel 族
-2. **`build`**：从输入推断 shape，根据 shape + 配置选择具体 kernel 实例
-3. **`__call__`**：验证输入 → build → 执行 → 后处理
-4. **`default_kernel_map`**：声明 Op 需要的 kernel 族（dispatch 用）
+1. **`__init__`**：只保存构造期配置并安装 `kernel_map`，不读取设备、不保存 shape
+2. **Op cache**：缓存 target/backend callable；builtin 与外部 target 各自拥有具体实现策略
+3. **callable**：每次读取当前 tensor 的 shape/dtype，解析 shape-dependent 默认值并选择具体 kernel
+4. **`default_kernel_map`**：只维护 role → kernel class，不隐含优先级
+5. **selection**：沿用 #1896 的 `Kernel.applies/refusal` + `select_kernel_key` 契约；顺序不决定结果，重叠区域必须报歧义
+6. **缓存边界**：本轮不新增 shape/metadata cache；具体 kernel 编译复用由 TileLang cache 负责
 
 **与重构前的对比：**
 - ❌ 重构前：构造时固定 shape，forward 时验证 shape 是否匹配
-- ✅ 重构后：构造时只保存配置，build 时从输入推断 shape
+- ✅ 重构后：构造时只保存配置，cached callable 每次从输入推断 shape
 
 **遵循的规则：**
 - ✅ 配置参数在构造时验证
-- ✅ Shape 相关的选择延迟到 build
-- ✅ 可选输入的语义约束在 `__call__` 中验证
-- ✅ Kernel 实例按需构建和缓存
+- ✅ Shape 相关的选择位于 backend callable 内
+- ✅ 可选输入的语义约束在公共 Op 边界验证
+- ✅ `batch/seq_len/dim/resolved_scale` 等 per-call facts 不写回 Op
+- ✅ callable 不重新探测 target/device
+- ✅ 不额外维护 shape → kernel 的 Python 缓存
+- ✅ 临时 selection facts 只用于一次选择，不写回 Op，也不是 metadata cache
 
 ### 3.3 功能 Dispatch 对比
 
@@ -406,7 +435,7 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
 | **Shape 约束** | 构造时固定 batch/seq_len | 构造时无 shape，forward 时推断 |
 | **FP8 scales** | 强制必需 | 可选 + 运行时验证 |
 | **RoPE** | 运行时判断 | 构造时确定，tables 延迟生成 |
-| **Kernel 选择** | 部分在构造时 | 完全在构造时（基于配置）|
+| **Kernel 选择** | 部分在构造时 | target callable 缓存；具体 kernel 按每次调用的 shape/dtype 选择 |
 | **S_q ≠ S_kv** | 不支持 | ✅ 支持 |
 | **动态 shape** | 不支持（需创建新实例）| ✅ 支持（同实例处理多种 shape）|
 
@@ -843,36 +872,22 @@ output = prefill_op(q, k_new, v_new, k_cache=k_cache, v_cache=v_cache)
 
 ### 8.1 问题背景
 
-#### TileOps 当前的 Kernel 缓存机制
+#### 本次 PR 的 callable 与编译缓存边界
 
-TileOps Op 基类提供了 kernel 缓存机制（`Op.get_or_build_kernel`）：
+本次 Dense 设计区分两种缓存：
 
-```python
-class Op:
-    _kernel_roles: dict[str, dict[Hashable, object]]  # {role: {cache_key: kernel}}
-    
-    def _cache_key(self, *input_shapes: tuple[int, ...]) -> Hashable:
-        """从输入 shape 计算 cache key（排除静态维度）"""
-        return tuple(
-            s for i, shape in enumerate(input_shapes)
-            for axis, s in enumerate(shape)
-            if (i, axis) not in self._static_axes
-        )
-    
-    def get_or_build_kernel(self, role: str, factory: Callable, *input_shapes):
-        """基于 shape 缓存编译好的 kernel"""
-        key = self._cache_key(*input_shapes)
-        if key not in self._kernel_roles.setdefault(role, {}):
-            self._kernel_roles[role][key] = factory()
-        return self._kernel_roles[role][key]
+1. `Op.get_or_build_kernel` 保存 target/backend 返回的 callable；builtin 使用不含动态 shape 的 key，使同一个 callable 可以服务多个 Dense shape。
+2. callable 每次根据当前 tensor metadata 选择具体 kernel；相同具体配置的编译产物由 TileLang 自身的编译缓存复用。
+
+```text
+Op cache:        target/config → backend callable
+每次调用:        shape/dtype → kernel role
+TileLang cache:  concrete kernel config → compiled program
 ```
 
-**Kernel 缓存解决的问题**：
-- 避免重复编译 CUDA/Triton kernel
-- 避免重复的 kernel 选择逻辑
-- Cache key 基于输入 tensor 的 **shape**（非静态维度）
+本次不增加第四层 `shape → kernel object` Python cache，也不把最后一次调用的 shape 写回 Op。
 
-#### 对于 Dense Layout：Kernel 缓存足够
+#### 对于 Dense Layout：无需 metadata cache
 
 ```python
 # Dense GQA Prefill
@@ -880,20 +895,20 @@ op = GroupedQueryAttentionPrefillDenseFwdOp(is_causal=True)
 
 # Layer 1
 output = op(q, k, v)  # shape = [B, S, H, D]
-# → 选择并编译 kernel → 缓存
+# → callable 选择 kernel；TileLang 编译或命中编译缓存
 
 # Layer 2-80
 output = op(q, k, v)  # 相同 shape
-# → 命中缓存，直接使用编译好的 kernel
+# → callable 再次执行轻量选择；TileLang 命中已有编译产物
 ```
 
 **开销分析**：
 - ✅ Kernel 编译：只做一次
-- ✅ Kernel 选择：只做一次
+- ✅ Kernel 选择：每次执行，但只读取 tensor shape/dtype 和构造期配置
 - ✅ 参数验证：每层都做，但开销很小（shape 检查）
 - ✅ Metadata：几乎没有（只有 shape）
 
-**结论**：对于 Dense layout，当前的 kernel 缓存已经提供了足够的优化。
+**结论**：对于 Dense layout，轻量 runtime dispatch + TileLang 编译缓存已经足够；暂不引入额外 metadata cache。
 
 #### 对于 Varlen/Packed Layout：Kernel 缓存不够
 
@@ -905,7 +920,7 @@ op = GroupedQueryAttentionPrefillPackedFwdOp(is_causal=True)
 output = op(q, k, v, 
             cu_seqlens_q, cu_seqlens_kv,      # [B+1] 累积索引
             max_seqlen_q=128, max_seqlen_kv=256)
-# → 选择并编译 kernel → 缓存 kernel
+# → callable 选择 kernel；TileLang 编译或命中编译缓存
 # → 验证 cu_seqlens 的一致性
 # → 传输 cu_seqlens 到 GPU（如果在 CPU）
 # → Kernel 内部解析 cu_seqlens
@@ -922,8 +937,8 @@ output = op(q, k, v,
 ```
 
 **开销分析**：
-- ✅ Kernel 编译：只做一次（kernel 缓存有效）
-- ✅ Kernel 选择：只做一次（kernel 缓存有效）
+- ✅ Kernel 编译：相同具体配置命中 TileLang 编译缓存
+- ✅ Kernel 选择：每次执行轻量 metadata dispatch
 - ❌ Metadata 验证：每层都做（80 次）
 - ❌ Metadata 传输：每层都可能发生（80 次）
 - ❌ Metadata 解析：kernel 内部每次都解析（80 次）
