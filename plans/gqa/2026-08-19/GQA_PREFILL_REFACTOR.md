@@ -6,6 +6,8 @@
 
 Dense Op 实例只保存构造期语义配置，不保存任何一次调用的 shape。Op 层先按 target 选择并缓存 backend callable；该 callable 每次调用读取当前 `q/k/v` 的 shape/dtype，再选择并调用具体 Kernel。callable 不再读 device 选择 backend，也不把 per-call shape 写回 Op。
 
+callable 不是为了减少透传参数，而是 backend 边界：它固定该 backend 的构造期配置，在具体 Kernel 缓存未命中时按当前 shape 选择、构造并持有 Kernel。Op 的 `kernel_map` 提供 `role → Kernel class`，callable 的缓存保存 `call signature → Kernel instance`。
+
 RoPE 采用 caller-owned ABI：
 
 ```python
@@ -313,9 +315,11 @@ target 解析并缓存 backend callable
     ↓
 读取当前 q/k/v 的 shape、dtype
     ↓
-按 `Kernel.applies/refusal` 选择唯一 Dense kernel role
+查询具体 Kernel 缓存
     ↓
-kernel_map[role] → 具体 kernel
+未命中时按 `Kernel.applies/refusal` 选择 role
+    ↓
+kernel_map[role] → 构造并缓存具体 Kernel
 ```
 
 第一级只决定由哪个 target/backend 提供实现；第二级由该 backend 的 callable 自己完成 shape 相关的 kernel dispatch。Dense callable 不读取 device 来再次选择 backend，device/target 已经在上一级确定。
@@ -436,10 +440,10 @@ class DensePrefillBuiltinCallable:
             target_facts=self.target_facts,
             config=self.config,
         )
-        role = select_kernel_key(DENSE_PREFILL_KEYS, call)
         signature = DenseSignature.from_call(call)
         kernel = self.specializations.get(signature)
         if kernel is None:
+            role = select_kernel_key(DENSE_PREFILL_KEYS, call)
             kernel = self.kernel_map[role](...)
             self.specializations.put_bounded(signature, kernel)
         return kernel(q, k, v, *optional_inputs)
@@ -947,12 +951,12 @@ output = op(q, k, v)  # shape = [B, S, H, D]
 
 # Layer 2-80
 output = op(q, k, v)  # 相同 shape
-# → callable 再次执行轻量选择，并命中已构造的 Kernel object
+# → callable 直接命中已构造的 Kernel object
 ```
 
 **开销分析**：
 - ✅ Kernel 编译：只做一次
-- ✅ Kernel 选择：每次执行，但只读取 tensor shape/dtype 和构造期配置
+- ✅ Kernel 选择：只在新 call signature 的缓存未命中时执行
 - ✅ 参数验证：每层都做，但开销很小（shape 检查）
 - ✅ Metadata：几乎没有（只有 shape）
 
