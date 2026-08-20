@@ -47,9 +47,9 @@ block_table: [B, max_blocks]               # 每个序列的 page 索引
 cache_seqlens: [B]                         # 每个序列在 cache 中的长度
 ```
 - **特点**：KV cache 以 page 为单位管理，支持动态增长
-- **适用场景**：
-  - Decode 阶段的 autoregressive 生成
-  - 需要高效管理 KV cache 的场景（如 vLLM、PagedAttention）
+- **适用场景**（Prefill 阶段）：
+  - **Chunked Prefill**：将长 prompt 分批处理，每批 append 到 paged KV cache
+  - **Continuous Batching**：动态调度场景，需要灵活的 memory 管理（如 vLLM）
 
 ### 1.2 其他功能维度（作为参数变体）
 
