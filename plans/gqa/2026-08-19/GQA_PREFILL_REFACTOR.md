@@ -314,7 +314,7 @@ kernel_map[role] → 构造并缓存具体 Kernel
 | --- | --- | --- | --- |
 | target/backend builder | 外部包通过 entry point 执行 `register_detector(target, detect)` 与 `register_kernel_builder(op, target, builder)`；builtin 不注册外部 builder | 进程全局 backend registry；首次成功调用后，选中的 builder 固定在该 Op 实例 | 首次按显式 `target=`、进程默认 target 或输入 device detector 选择；之后不再重新选择 backend |
 | builtin backend callable | Op 的 builtin `build` 构造 `_DenseBuiltin` | Op 实例的 kernel-role entry | Op 提供的稳定 construction key；当前包含 device、输入/输出 dtype，构造期 params 已固定在 Op 实例中；不包含 `B/S/H/D` 等动态 shape |
-| external backend callable | 已注册的 external builder 接收 manifest 顺序的 `TensorSpec` 与确定 params，返回任意 callable；无需再注册这个 callable | Op 实例的 external signature table | device + 每个实际输入的 `(dtype, shape)`；同设备、同签名直接复用 builder 上次返回的 callable |
+| external backend callable | 已注册的 external builder 接收 manifest 固定顺序的 8 个 input slots 与确定 params，返回任意 callable；present slot 为 `TensorSpec`，absent optional slot 为 `None`，无需再注册这个 callable | Op 实例的 external signature table | device + 每个 manifest input slot 的 `(dtype, shape) | None`；同设备、同签名直接复用 builder 上次返回的 callable |
 | builtin concrete Kernel | callable 用 `Kernel.applies/refusal` 选出 role，再由 `kernel_map[role]` 构造 | builtin callable 内部的有界 Kernel ownership cache | role + Kernel construction signature，例如 `B/S_q/S_kv/H/H_kv/D`、输入/输出 dtype；不使用 tensor 内容 |
 | external concrete Kernel | external callable 可以本身就是一个 kernel，也可以在内部维护 dispatcher、kernel map 和缓存 | 完全由 external backend 管理 | 完全由 external backend 定义；TileOps 不读取也不约束其内部 key |
 | GPU 编译产物 | 具体 Kernel 调用 TileLang/JIT 产生 | TileLang 编译缓存 | kernel 定义、target 与编译期配置；不由 Op/callable cache 代替 |
@@ -398,6 +398,8 @@ class GroupedQueryAttentionDenseFwdOp(Op):
         _validate_dense_inputs(
             q, k, v, q_scale, k_scale, v_scale, rope_cos, rope_sin
         )
+        # Always preserve all eight manifest slots. An omitted optional tensor
+        # remains None; later inputs never shift left.
         inputs = _normalize_dense_inputs(
             q, k, v, q_scale, k_scale, v_scale, rope_cos, rope_sin
         )
@@ -427,7 +429,11 @@ class _DenseBuiltin:
     # path and does not construct a Kernel.
     specializations: OrderedDict[AttentionCall, Kernel]
 
-    def __call__(self, q, k, v, *optional_inputs):
+    def __call__(
+        self, q, k, v,
+        q_scale=None, k_scale=None, v_scale=None,
+        rope_cos=None, rope_sin=None,
+    ):
         call = self.compile_info.for_tensors(q, k, tune=self.tune_enabled())
         kernel = self.specializations.get(call)
         if kernel is None:
@@ -435,7 +441,12 @@ class _DenseBuiltin:
             role = select_kernel_key(keys, call)
             kernel = self.kernel_map[role](...)
             self.specializations.put_bounded(call, kernel)
-        return kernel(q, k, v, *optional_inputs)
+        return _invoke_dense_kernel(
+            kernel, call,
+            q, k, v,
+            q_scale, k_scale, v_scale,
+            rope_cos, rope_sin,
+        )
 ```
 
 **关键设计点：**
