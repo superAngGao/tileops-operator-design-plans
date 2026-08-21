@@ -308,6 +308,19 @@ target 解析并缓存 backend callable
 kernel_map[role] → 构造并缓存具体 Kernel
 ```
 
+各层的注册与缓存边界如下：
+
+| 层级 | 注册或产生机制 | 保存位置 | 缓存命中依据 |
+| --- | --- | --- | --- |
+| target/backend builder | 外部包通过 entry point 执行 `register_detector(target, detect)` 与 `register_kernel_builder(op, target, builder)`；builtin 不注册外部 builder | 进程全局 backend registry；首次成功调用后，选中的 builder 固定在该 Op 实例 | 首次按显式 `target=`、进程默认 target 或输入 device detector 选择；之后不再重新选择 backend |
+| builtin backend callable | Op 的 builtin `build` 构造 `DensePrefillBuiltinCallable` | Op 实例的 kernel-role entry | Op 提供的稳定 construction key；当前包含 device、输入/输出 dtype，构造期 params 已固定在 Op 实例中；不包含 `B/S/H/D` 等动态 shape |
+| external backend callable | 已注册的 external builder 接收 manifest 顺序的 `TensorSpec` 与确定 params，返回任意 callable；无需再注册这个 callable | Op 实例的 external signature table | device + 每个实际输入的 `(dtype, shape)`；同设备、同签名直接复用 builder 上次返回的 callable |
+| builtin concrete Kernel | callable 用 `Kernel.applies/refusal` 选出 role，再由 `kernel_map[role]` 构造 | builtin callable 内部的有界 Kernel ownership cache | role + Kernel construction signature，例如 `B/S_q/S_kv/H/H_kv/D`、输入/输出 dtype；不使用 tensor 内容 |
+| external concrete Kernel | external callable 可以本身就是一个 kernel，也可以在内部维护 dispatcher、kernel map 和缓存 | 完全由 external backend 管理 | 完全由 external backend 定义；TileOps 不读取也不约束其内部 key |
+| GPU 编译产物 | 具体 Kernel 调用 TileLang/JIT 产生 | TileLang 编译缓存 | kernel 定义、target 与编译期配置；不由 Op/callable cache 代替 |
+
+严格来说，写入进程全局 registry 的只有 detector 和 external builder；builtin 的 role → Kernel class 映射安装在 Op 实例上。backend callable 和具体 Kernel 都是运行时构造并保存的对象，不需要再次注册。
+
 第一级只决定由哪个 target/backend 提供实现；第二级由该 backend 的 callable 自己完成 shape 相关的 kernel dispatch。Dense callable 不读取 device 来再次选择 backend，device/target 已经在上一级确定。
 
 内置实现的结构如下：
