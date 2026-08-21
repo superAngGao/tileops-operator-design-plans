@@ -11,7 +11,7 @@ callable 不是为了减少透传参数，而是 backend 边界：它固定该 b
 RoPE 采用 caller-owned ABI：
 
 ```python
-op = GroupedQueryAttentionPrefillDenseFwdOp(
+op = GroupedQueryAttentionDenseFwdOp(
     is_causal=True,
     pos_encoding_mode="rope",
     rotary_dim=64,
@@ -117,9 +117,9 @@ last_page_len: [B]
 次要变体（功能）  → 函数参数
 ```
 
-**下一步计划发布的 2 个 Op：**
-1. **`GroupedQueryAttentionDenseFwdOp`** - Dense layout；内部按 workload 选择 prefill 或 decode kernel
-2. **`GroupedQueryAttentionPagedFwdOp`** - Paged layout；内部按每个 request 的 query metadata 选择 prefill 或 decode kernel
+**发布边界：**
+1. **`GroupedQueryAttentionDenseFwdOp`** - 本轮完成；内部按 workload 选择 prefill 或 decode kernel
+2. **`GroupedQueryAttentionPagedFwdOp`** - 下一步；内部按每个 request 的 query metadata 选择 prefill 或 decode kernel
 
 **暂缓发布：** `GroupedQueryAttentionVarlenFwdOp`。Varlen/Packed 的设计保留，但在明确训练、离线批处理或框架接入需求前不作为 release-facing Op 推进。
 
@@ -290,7 +290,7 @@ class GroupedQueryAttentionFwdOp(Op):
 
 ### 3.2 重构后的 Dispatch（本次 PR）
 
-`GroupedQueryAttentionPrefillDenseFwdOp` 使用两级 dispatch：
+`GroupedQueryAttentionDenseFwdOp` 使用两级 dispatch，同一 BSHD ABI 覆盖 prefill 与 contiguous decode：
 
 ```text
 Op 构造期配置
@@ -313,7 +313,7 @@ kernel_map[role] → 构造并缓存具体 Kernel
 | 层级 | 注册或产生机制 | 保存位置 | 缓存命中依据 |
 | --- | --- | --- | --- |
 | target/backend builder | 外部包通过 entry point 执行 `register_detector(target, detect)` 与 `register_kernel_builder(op, target, builder)`；builtin 不注册外部 builder | 进程全局 backend registry；首次成功调用后，选中的 builder 固定在该 Op 实例 | 首次按显式 `target=`、进程默认 target 或输入 device detector 选择；之后不再重新选择 backend |
-| builtin backend callable | Op 的 builtin `build` 构造 `DensePrefillBuiltinCallable` | Op 实例的 kernel-role entry | Op 提供的稳定 construction key；当前包含 device、输入/输出 dtype，构造期 params 已固定在 Op 实例中；不包含 `B/S/H/D` 等动态 shape |
+| builtin backend callable | Op 的 builtin `build` 构造 `_DenseBuiltin` | Op 实例的 kernel-role entry | Op 提供的稳定 construction key；当前包含 device、输入/输出 dtype，构造期 params 已固定在 Op 实例中；不包含 `B/S/H/D` 等动态 shape |
 | external backend callable | 已注册的 external builder 接收 manifest 顺序的 `TensorSpec` 与确定 params，返回任意 callable；无需再注册这个 callable | Op 实例的 external signature table | device + 每个实际输入的 `(dtype, shape)`；同设备、同签名直接复用 builder 上次返回的 callable |
 | builtin concrete Kernel | callable 用 `Kernel.applies/refusal` 选出 role，再由 `kernel_map[role]` 构造 | builtin callable 内部的有界 Kernel ownership cache | role + Kernel construction signature，例如 `B/S_q/S_kv/H/H_kv/D`、输入/输出 dtype；不使用 tensor 内容 |
 | external concrete Kernel | external callable 可以本身就是一个 kernel，也可以在内部维护 dispatcher、kernel map 和缓存 | 完全由 external backend 管理 | 完全由 external backend 定义；TileOps 不读取也不约束其内部 key |
@@ -326,8 +326,8 @@ kernel_map[role] → 构造并缓存具体 Kernel
 内置实现的结构如下：
 
 ```python
-class GroupedQueryAttentionPrefillDenseFwdOp(Op):
-    """Shape-agnostic BSHD GQA prefill with caller-owned optional RoPE tables."""
+class GroupedQueryAttentionDenseFwdOp(Op):
+    """Shape-agnostic BSHD GQA with caller-owned optional RoPE tables."""
     
     def __init__(self,
                  is_causal: bool = True,
@@ -368,21 +368,25 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
             "gqa_prefill_dense_fwd_kernel": GQAPrefillDenseFwdKernel,
             "gqa_prefill_causal_fwd_kernel": GQAPrefillFwdWsPersistentCausalKernel,
             "gqa_prefill_square_fwd_kernel": GQAFwdWsPersistentCausalKernel,
+            "gqa_decode_kernel": GQADecodeKernel,
+            "gqa_decode_bs1_kernel": GQADecodeBs1Kernel,
         }
     
     def _build_builtin_callable(self, target_facts):
-        return DensePrefillBuiltinCallable(
+        return _DenseBuiltin(
             kernel_map=self.kernel_map,
-            target_facts=target_facts,
-            is_causal=self.is_causal,
-            sm_scale=self.sm_scale,
-            softcap=self.softcap,
-            window_size_left=self.window_size_left,
-            window_size_right=self.window_size_right,
-            pos_encoding_mode=self.pos_encoding_mode,
-            rotary_dim=self.rotary_dim,
-            rope_layout=self.rope_layout,
-            output_dtype=self.dtype,
+            compile_info=_DenseCompileInfo(
+                target_facts=target_facts,
+                is_causal=self.is_causal,
+                sm_scale=self.sm_scale,
+                softcap=self.softcap,
+                window_size_left=self.window_size_left,
+                window_size_right=self.window_size_right,
+                fuse_rope=self.pos_encoding_mode == "rope",
+                rotary_dim=self.rotary_dim,
+                rope_layout=self.rope_layout,
+                output_dtype=self.dtype,
+            ),
             tune=self.tune,
         )
 
@@ -400,7 +404,7 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
 
         # Cache 中保存 backend callable，而不是第一次 shape 的 kernel。
         callable = self.get_or_build_kernel(
-            "gqa_prefill_dense",
+            "gqa_dense",
             inputs,
             key=(q.device, q.dtype, self.dtype),
             build=lambda: self._build_builtin_callable(
@@ -410,41 +414,27 @@ class GroupedQueryAttentionPrefillDenseFwdOp(Op):
         return callable(*inputs)
 
 
-class DensePrefillBuiltinCallable:
+class _DenseCompileInfo:
+    # 只集中保存构造期语义和 target facts，不增加缓存层。
+    def for_tensors(self, q, k, *, tune):
+        return AttentionCall(...)
+
+
+class _DenseBuiltin:
     # Bounded ownership cache. It is backend-callable state, not Op dispatch
     # state: retained Kernel objects remain enumerable/autotunable. After a
     # same-signature warmup, CUDA Graph capture follows the lock-free cache-hit
     # path and does not construct a Kernel.
-    specializations: OrderedDict[DenseSignature, DensePrefillKernel]
+    specializations: OrderedDict[AttentionCall, Kernel]
 
     def __call__(self, q, k, v, *optional_inputs):
-        # 所有 shape 派生值均为本次调用的局部变量。
-        batch, seq_len_q, heads, dim = q.shape
-        _, seq_len_kv, heads_kv, _ = k.shape
-        sm_scale = self.sm_scale if self.sm_scale is not None else dim**-0.5
-        rotary_dim = self.rotary_dim if self.rotary_dim is not None else dim
-
-        # call 只是本次选择所需的临时 facts，不写回 Op。
-        call = dense_selection_facts(
-            batch=batch,
-            seq_len_q=seq_len_q,
-            seq_len_kv=seq_len_kv,
-            heads=heads,
-            heads_kv=heads_kv,
-            dim=dim,
-            input_dtype=q.dtype,
-            output_dtype=self.output_dtype or q.dtype,
-            sm_scale=sm_scale,
-            rotary_dim=rotary_dim,
-            target_facts=self.target_facts,
-            config=self.config,
-        )
-        signature = DenseSignature.from_call(call)
-        kernel = self.specializations.get(signature)
+        call = self.compile_info.for_tensors(q, k, tune=self.tune_enabled())
+        kernel = self.specializations.get(call)
         if kernel is None:
-            role = select_kernel_key(DENSE_PREFILL_KEYS, call)
+            keys = DENSE_FWD_DECODE_KEYS if decode_region(call) else DENSE_FWD_PREFILL_KEYS
+            role = select_kernel_key(keys, call)
             kernel = self.kernel_map[role](...)
-            self.specializations.put_bounded(signature, kernel)
+            self.specializations.put_bounded(call, kernel)
         return kernel(q, k, v, *optional_inputs)
 ```
 
@@ -492,12 +482,13 @@ class DensePrefillBuiltinCallable:
 
 ### 4.1 本次 PR 完成的工作
 
-本次 PR（#1926）专注于 **Dense Prefill** 的重构：
+本次 PR（#1926）完成 **Dense layout 前向接口统一**：
 
-#### 1. 创建 `GroupedQueryAttentionPrefillDenseFwdOp`
+#### 1. 创建 `GroupedQueryAttentionDenseFwdOp`
 
 **核心功能：**
 - ✅ Dense tensor 输入 `[B, S_q, H, D]`
+- ✅ 同一 BSHD ABI 覆盖 prefill 与 contiguous decode；`S_q == 1` 可选择 decode specialization
 - ✅ 支持可变的 S_q 和 S_kv
 - ✅ FP8 + optional scales
 - ✅ Fused RoPE（通过 `pos_encoding_mode='rope'`）
@@ -528,6 +519,7 @@ class DensePrefillBuiltinCallable:
 - `GQADensePrefillCausalKernel` - Causal dense prefill
 - `GQADensePrefillRoPEKernel` - Dense prefill with fused RoPE
 - `GQADensePrefillFP8Kernel` - FP8 dense prefill
+- `GQADecodeKernel` / `GQADecodeBs1Kernel` - contiguous decode specialization
 
 #### 3. Benchmark 和测试更新
 
@@ -552,9 +544,6 @@ class DensePrefillBuiltinCallable:
 ❌ **Paged Prefill 的重构**
 - `GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp` 保持不变
 
-❌ **Decode Ops**
-- `GroupedQueryAttentionDecodeWithKVCacheFwdOp` 等不在本次范围
-
 ❌ **移除 Legacy Adapter**
 - `GroupedQueryAttentionFwdOp` 保留作为兼容层
 
@@ -564,7 +553,7 @@ class DensePrefillBuiltinCallable:
 ### 4.3 核心变更文件
 
 ```
-src/tileops/ops/attention/gqa.py                   # 新增 PrefillDenseFwdOp
+src/tileops/ops/attention/gqa.py                   # DenseFwdOp 与两级 dispatch
 src/tileops/kernels/attention/gqa_dense_prefill.py # Dense prefill kernels
 src/tileops/kernels/attention/gqa_fwd_fp8.py       # FP8 kernel 整合
 src/tileops/manifest/attention.yaml                # Manifest 更新
@@ -577,17 +566,7 @@ benchmarks/ops/attention/bench_gqa.py              # Benchmark 更新
 
 ## 五、后续计划
 
-### 5.1 Phase 2: Dense Prefill/Decode 合并（下一步）
-
-**目标：** 将 Dense prefill 与 contiguous decode 收敛为 `GroupedQueryAttentionDenseFwdOp`。
-
-**主要工作：**
-1. 统一 Dense public ABI，移除 public 名称中的 phase。
-2. builtin callable 每次读取当前 shape 和静态 metadata，在 dense prefill/decode kernel family 中选择具体 Kernel。
-3. 合并 causal、window、RoPE、softcap、16-bit/FP8 的 manifest、test 和 benchmark 覆盖。
-4. 对相同 workload 做迁移前后 correctness、latency 和 compile/CUDA Graph 回归。
-
-### 5.2 Phase 3: Paged Prefill/Decode 合并
+### 5.1 Paged Prefill/Decode 合并
 
 **目标：** 将 paged prefill 与 paged decode 收敛为 `GroupedQueryAttentionPagedFwdOp`。
 
@@ -597,7 +576,7 @@ benchmarks/ops/attention/bench_gqa.py              # Benchmark 更新
 3. 保留独立 prefill/decode kernel family，并统一 FP8、RoPE、window、softcap 等能力矩阵。
 4. cache append 和 mutation 明确在 Op 外完成，本计划不增加 `append` 参数。
 
-### 5.3 Varlen 发布暂缓
+### 5.2 Varlen 发布暂缓
 
 Varlen/Packed 的连续 ragged topology 仍有训练和离线批处理价值，但不是当前在线 serving 的发布主线。本阶段：
 
@@ -606,7 +585,7 @@ Varlen/Packed 的连续 ragged topology 仍有训练和离线批处理价值，�
 - 保留必要的现有实现和研究结果；
 - 等明确的框架消费者、workload 与性能目标后再决定是否发布 `GroupedQueryAttentionVarlenFwdOp`。
 
-### 5.4 Phase 4: 移除 Legacy Adapters
+### 5.3 移除 Legacy Adapters
 
 **目标：** 清理历史遗留代码
 
@@ -629,7 +608,7 @@ Varlen/Packed 的连续 ragged topology 仍有训练和离线批处理价值，�
    - 添加迁移指南
    - 发布 changelog
 
-### 5.5 Phase 5: 性能优化（持续）
+### 5.4 性能优化（持续）
 
 **基于清晰边界的优化机会：**
 
@@ -669,11 +648,11 @@ Layout 是主要变体 → 拆分为独立 Ops
 
 ### 6.2 本次 PR 的价值
 
-✅ **职责清晰**：Dense Prefill 有了专门的 Op  
+✅ **职责清晰**：Dense layout 的 prefill/decode 共享一个 Op
 ✅ **接口简化**：可选输入 + 自动推断  
 ✅ **性能优化**：RoPE 前移 + compile contract  
 ✅ **类型安全**：Manifest + runtime 双重验证  
-✅ **可扩展性**：为后续 Dense/Paged phase 合并奠定基础
+✅ **可扩展性**：为后续 Paged phase 合并建立同一模式
 
 ### 6.3 对用户的影响
 
@@ -682,12 +661,12 @@ Layout 是主要变体 → 拆分为独立 Ops
 # 旧代码（Square GQA）
 op = GroupedQueryAttentionFwdOp(batch=4, seq_len=512, heads=32, heads_kv=8, dim=128)
 
-# 新代码（Dense Prefill）- Shape-agnostic
-op = GroupedQueryAttentionPrefillDenseFwdOp(is_causal=True)
+# 新代码（Dense prefill/decode）- Shape-agnostic
+op = GroupedQueryAttentionDenseFwdOp(is_causal=True)
 # batch/heads/heads_kv/seq_len/dim 自动从输入推断
 
 # 带配置参数的示例
-op = GroupedQueryAttentionPrefillDenseFwdOp(
+op = GroupedQueryAttentionDenseFwdOp(
     is_causal=True,
     sm_scale=0.125,
     softcap=2.0,
