@@ -1,4 +1,4 @@
-# GQA Prefill 重构详解
+# GQA 前向算子重构详解
 
 > 2026-08-20 决策更新：本节优先于文档中与之冲突的早期草案。
 
@@ -43,9 +43,9 @@ v: [B, S_kv, H_kv, D]
 ```
 - **特点**：batch 内所有序列共享相同的 tensor 维度
 - **适用场景**：
+  - Batch=1 的低延迟推理
   - Batch 内序列长度相同或相近
-  - Prefill 阶段的标准输入
-  - 简单直观，易于使用
+  - 同一 ABI 下的 dense prefill 与 contiguous decode
 
 #### **Varlen/Packed Layout**
 ```python
@@ -61,34 +61,31 @@ max_seqlen_kv: int
 - **适用场景**：
   - Batch 内序列长度差异大（如 [128, 512, 1024, 2048]）
   - 避免 padding 带来的计算和内存浪费
-  - Serving 场景的动态 batching
+  - 训练、离线批处理及无 paged KV cache 的 ragged attention
+- **发布决策**：保留设计与内部实现价值，但暂缓作为 release-facing Op 发布
 
 #### **Paged Layout (with KV Cache)**
 ```python
-q: [B, S_new, H, D]         # 新的 query tokens
-k_new: [B, S_new, H_kv, D]  # 新的 key tokens
-v_new: [B, S_new, H_kv, D]  # 新的 value tokens
+q: [total_q, H, D]                       # 当前 query tokens
+qo_indptr: [B+1]                         # 每个 request 的 query 边界
 k_pages: [num_pages, page_size, H_kv, D]  # 分页的 KV cache
 v_pages: [num_pages, page_size, H_kv, D]
-block_table: [B, max_blocks]               # 每个序列的 page 索引
-cache_seqlens: [B]                         # 每个序列在 cache 中的长度
+page_indptr: [B+1]
+page_indices: [num_referenced_pages]
+last_page_len: [B]
 ```
-- **特点**：KV cache 以 page 为单位管理，支持动态增长
-- **适用场景**（Prefill 阶段）：
-  - **Chunked Prefill**：将长 prompt 分批处理，每批 append 到 paged KV cache
-  - **Continuous Batching**：动态调度场景，需要灵活的 memory 管理（如 vLLM）
+- **特点**：KV cache 以 page 为单位管理；同一只读 ABI 覆盖 paged prefill 与 paged decode
+- **适用场景**：continuous batching、prefix cache、chunked prefill 和多用户 serving
+- **边界**：调用方在 attention 前完成 KV cache 写入；Op 不 append、不修改 pages
 
 ### 1.2 其他功能维度（作为参数变体）
 
 这些是相对较小的变体，通常作为函数参数或配置选项：
 
 #### **KV Cache Support**
-- `k_cache: Optional[Tensor]` - 已有的 KV cache
-- `v_cache: Optional[Tensor]` - 已有的 KV cache
-- **使用场景：** Incremental prefill，需要对 `[cache + new]` 做 attention
-- **重要原则：** Op 层只负责参数传递，**不强制 concat**，由后端 kernel 决定如何处理
-  - 高级 kernel（如 FA3）可以原生支持分离的 cache 和 new KV，避免 memory copy
-  - 标准 kernel 需要 contiguous KV 时，由 backend 层负责 concat
+- Dense/Varlen 调用方传入本次 attention 可见的完整连续 K/V。
+- Paged 调用方传入已经写好的只读 K/V pages 与 page metadata。
+- KV allocation、slot assignment 和 append 均由 runtime 管理，不属于 Attention Op 契约。
 
 #### **Causal Masking**
 - `is_causal: bool` - 是否使用因果 mask（autoregressive 场景）
@@ -120,15 +117,16 @@ cache_seqlens: [B]                         # 每个序列在 cache 中的长度
 次要变体（功能）  → 函数参数
 ```
 
-**计划的 3 个 Op：**
-1. **`GroupedQueryAttentionPrefillDenseFwdOp`** - Dense layout prefill
-2. **`GroupedQueryAttentionPrefillPackedFwdOp`** - Varlen/Packed layout prefill
-3. **`GroupedQueryAttentionPrefillPagedFwdOp`** - Paged layout prefill (with KV cache)
+**下一步计划发布的 2 个 Op：**
+1. **`GroupedQueryAttentionDenseFwdOp`** - Dense layout；内部按 workload 选择 prefill 或 decode kernel
+2. **`GroupedQueryAttentionPagedFwdOp`** - Paged layout；内部按每个 request 的 query metadata 选择 prefill 或 decode kernel
 
-每个 Op 通过参数支持 causal/non-causal、sliding window、RoPE、FP8 等功能。
+**暂缓发布：** `GroupedQueryAttentionVarlenFwdOp`。Varlen/Packed 的设计保留，但在明确训练、离线批处理或框架接入需求前不作为 release-facing Op 推进。
+
+Prefill/decode 是同一 layout 下的 kernel family，不再体现在 public Op 名称中。每个 Op 通过参数支持 causal/non-causal、sliding window、RoPE、FP8 等功能。
 
 **采用这种拆分的考虑：**
-- Varlen 和 Paged 两种变体可能需要通过 metadata 缓存管理来减少 CPU 端的计算量（详见[八、待讨论：Metadata 缓存机制](#八待讨论metadata-缓存机制)）
+- Paged 以及未来可能发布的 Varlen 需要评估 metadata 缓存，以减少 CPU 端重复处理（详见[七、待讨论：Metadata 缓存机制](#七待讨论metadata-缓存机制)）
 - 如果未来需要进一步收敛接口，这种拆分方式的重构成本相对较小
 - 每个 layout 有独立的优化空间和性能特征
 
@@ -137,7 +135,7 @@ cache_seqlens: [B]                         # 每个序列在 cache 中的长度
 - **Wrapper 层**：按 layout 拆分为独立的 Wrapper 类
   - `BatchPrefillWithRaggedKVCacheWrapper` - Ragged/Varlen
   - `BatchPrefillWithPagedKVCacheWrapper` - Paged
-- Wrapper 负责 metadata 预处理和缓存（详见[八、待讨论：Metadata 缓存机制](#八待讨论metadata-缓存机制)）
+- Wrapper 负责 metadata 预处理和缓存（详见[七、待讨论：Metadata 缓存机制](#七待讨论metadata-缓存机制)）
 
 **TileOps 与 FlashInfer 的设计差异：**
 - FlashInfer：用户直接调用函数，Wrapper 用于优化 batch 场景的 metadata 缓存
@@ -548,7 +546,7 @@ class DensePrefillBuiltinCallable:
 **本次 PR 不包含：**
 
 ❌ **Packed/Varlen Prefill 的重构**
-- `GroupedQueryAttentionPrefillFwdOp` 保持不变（仅在后续 PR 重命名为 `PrefillPackedFwdOp`）
+- `GroupedQueryAttentionPrefillFwdOp` 保持不变；新的 release-facing Varlen Op 暂缓
 
 ❌ **Paged Prefill 的重构**
 - `GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp` 保持不变
@@ -578,51 +576,36 @@ benchmarks/ops/attention/bench_gqa.py              # Benchmark 更新
 
 ## 五、后续计划
 
-### 5.1 Phase 2: Packed Prefill 重构（下一个 PR）
+### 5.1 Phase 2: Dense Prefill/Decode 合并（下一步）
 
-**目标：** 重构 Varlen/Packed prefill
-
-**主要工作：**
-1. **重命名 Op**
-   ```
-   GroupedQueryAttentionPrefillFwdOp 
-   → GroupedQueryAttentionPrefillPackedFwdOp
-   ```
-
-2. **统一 Packed Op 的接口**
-   - 将 `q_scale`, `k_scale`, `v_scale` 改为可选输入
-   - 添加 RoPE 支持（`pos_encoding_mode`）
-   - 统一参数命名和验证逻辑
-
-3. **整合 Sliding Window Varlen Op**
-   - 将 `GroupedQueryAttentionSlidingWindowVarlenFwdOp` 的功能整合到 `PrefillPackedFwdOp`
-   - 通过 `window_size_left/right` 参数控制
-
-4. **测试和 Benchmark**
-   - 覆盖 Packed 模式的所有变体
-   - 性能对比（vs Dense padding）
-
-### 5.2 Phase 3: Paged Prefill 整合（后续）
-
-**目标：** 整合 Paged prefill 和相关 Ops
+**目标：** 将 Dense prefill 与 contiguous decode 收敛为 `GroupedQueryAttentionDenseFwdOp`。
 
 **主要工作：**
-1. **统一 Paged Prefill Op**
-   ```
-   GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp
-   → GroupedQueryAttentionPrefillPagedFwdOp
-   ```
+1. 统一 Dense public ABI，移除 public 名称中的 phase。
+2. builtin callable 每次读取当前 shape 和静态 metadata，在 dense prefill/decode kernel family 中选择具体 Kernel。
+3. 合并 causal、window、RoPE、softcap、16-bit/FP8 的 manifest、test 和 benchmark 覆盖。
+4. 对相同 workload 做迁移前后 correctness、latency 和 compile/CUDA Graph 回归。
 
-2. **添加缺失的功能**
-   - FP8 support（目前只有部分支持）
-   - RoPE support
-   - Sliding window
+### 5.2 Phase 3: Paged Prefill/Decode 合并
 
-3. **与 Decode 的接口对齐**
-   - Paged prefill 和 paged decode 应使用一致的 KV cache layout
-   - 统一 `block_table`, `cache_seqlens` 等参数的语义
+**目标：** 将 paged prefill 与 paged decode 收敛为 `GroupedQueryAttentionPagedFwdOp`。
 
-### 5.3 Phase 4: 移除 Legacy Adapters
+**主要工作：**
+1. 统一只读 K/V pages ABI，以及 `qo_indptr`、`page_indptr`、`page_indices`、`last_page_len` 的语义。
+2. callable 根据每个 request 的 query metadata、batch、KV length 和其他构造事实选择 prefill/decode kernel；不把 phase 暴露为独立 Op。
+3. 保留独立 prefill/decode kernel family，并统一 FP8、RoPE、window、softcap 等能力矩阵。
+4. cache append 和 mutation 明确在 Op 外完成，本计划不增加 `append` 参数。
+
+### 5.3 Varlen 发布暂缓
+
+Varlen/Packed 的连续 ragged topology 仍有训练和离线批处理价值，但不是当前在线 serving 的发布主线。本阶段：
+
+- 不新增或重命名 release-facing Varlen Op；
+- 不为了接口对称扩展独立 Varlen specialization；
+- 保留必要的现有实现和研究结果；
+- 等明确的框架消费者、workload 与性能目标后再决定是否发布 `GroupedQueryAttentionVarlenFwdOp`。
+
+### 5.4 Phase 4: 移除 Legacy Adapters
 
 **目标：** 清理历史遗留代码
 
@@ -636,32 +619,30 @@ benchmarks/ops/attention/bench_gqa.py              # Benchmark 更新
    ```
    ❌ GroupedQueryAttentionFwdOp                    # 移除
    ❌ GroupedQueryAttentionSlidingWindowFwdOp       # 移除（功能已整合）
-   ❌ GroupedQueryAttentionSlidingWindowVarlenFwdOp # 移除（功能已整合）
    ```
+
+   Varlen 相关 legacy API 在发布决策前不纳入本阶段清理。
 
 3. **文档更新**
    - 更新 API 文档
    - 添加迁移指南
    - 发布 changelog
 
-### 5.4 Phase 5: 性能优化（持续）
+### 5.5 Phase 5: 性能优化（持续）
 
 **基于清晰边界的优化机会：**
 
-1. **Dense Prefill 优化**
+1. **Dense 优化**
    - 针对固定 shape 的 fast path（编译时优化）
    - 更激进的 kernel fusion（如 softmax + output scaling）
    - FP8 Tensor Core 充分利用
 
-2. **Packed Prefill 优化**
-   - 针对变长序列的负载均衡
-   - Warp-level 优化（减少 idle threads）
-
-3. **Paged Prefill 优化**
+2. **Paged 优化**
    - Page 访问的 locality 优化
    - Prefetch 策略
+   - Prefill/decode kernel family 的 workload dispatch
 
-4. **Cross-cutting 优化**
+3. **Cross-cutting 优化**
    - Flash Attention 3 后端整合
    - Custom CUDA kernel 优化
    - Torch.compile AOT 编译
@@ -677,14 +658,13 @@ Layout 是主要变体 → 拆分为独立 Ops
 功能是次要变体   → 统一为函数参数
 ```
 
-**3 个 Op 的最终形态：**
+**当前发布目标：**
 ```
-1. GroupedQueryAttentionPrefillDenseFwdOp   - Dense [B, S, H, D]
-2. GroupedQueryAttentionPrefillPackedFwdOp  - Packed [total, H, D] + cu_seqlens
-3. GroupedQueryAttentionPrefillPagedFwdOp   - Paged KV cache
+1. GroupedQueryAttentionDenseFwdOp  - Dense [B, S, H, D]，统一 prefill/decode
+2. GroupedQueryAttentionPagedFwdOp  - Paged KV cache，统一 prefill/decode
 ```
 
-每个 Op 通过参数支持：causal、sliding window、RoPE、FP8、softcap 等。
+`GroupedQueryAttentionVarlenFwdOp` 暂缓发布。每个已发布 Op 通过参数支持 causal、sliding window、RoPE、FP8、softcap 等功能，prefill/decode 只作为内部 kernel family 存在。
 
 ### 6.2 本次 PR 的价值
 
@@ -692,7 +672,7 @@ Layout 是主要变体 → 拆分为独立 Ops
 ✅ **接口简化**：可选输入 + 自动推断  
 ✅ **性能优化**：RoPE 前移 + compile contract  
 ✅ **类型安全**：Manifest + runtime 双重验证  
-✅ **可扩展性**：为后续 Packed/Paged 重构奠定基础  
+✅ **可扩展性**：为后续 Dense/Paged phase 合并奠定基础
 
 ### 6.3 对用户的影响
 
@@ -729,196 +709,9 @@ op = GroupedQueryAttentionPrefillDenseFwdOp(
 
 ---
 
-## 七、待讨论：Op 是否应该支持 KV Cache Append？
+## 七、待讨论：Metadata 缓存机制
 
 ### 7.1 问题背景
-
-当前设计中，`k_cache` 和 `v_cache` 作为**只读**参数传入 Op：
-
-```python
-# 用户需要在 Op 外部完成 append
-for i in range(batch):
-    seq_len = cache_seqlens[i]
-    k_cache[i, seq_len:seq_len+new_len] = k_new[i]
-    v_cache[i, seq_len:seq_len+new_len] = v_new[i]
-
-# 然后调用 Op
-output = prefill_op(q, k_new, v_new, k_cache=k_cache, v_cache=v_cache)
-```
-
-**问题：** 是否应该让 Op 直接支持 in-place append？
-
-```python
-# 方案：增加 append 参数
-output = prefill_op(q, k_new, v_new, 
-                    k_cache=k_cache, v_cache=v_cache,
-                    cache_seqlens=cache_seqlens,
-                    append=True)  # Op 内部完成 append + attention
-```
-
-### 7.2 支持 Append 的理由
-
-#### 1. **用户便利性**
-- 一次调用完成 append + attention
-- 避免用户写 Python loop 或 scatter 逻辑
-
-#### 2. **后端 Fusion 潜力**
-- 某些后端（如 FlashAttention 3）可能可以 fuse append + attention
-- 减少中间的 memory roundtrip
-- 类似 fused RoPE 的优化思路
-
-#### 3. **外围功能而非 Layout 变体**
-- Append 是**状态管理**功能，不是 layout 差异
-- 类似 RoPE、sliding window，应该作为参数而非独立 Op
-
-#### 4. **统一性**
-- Dense、Packed、Paged 三个 Prefill Ops 都提供一致的 append 接口
-- 用户体验统一
-
-### 7.3 反对 Append 的理由
-
-#### 1. **职责混淆**
-- Append 是 **memory operation**（写）
-- Attention 是 **compute operation**（读 + 计算）
-- 混在一起违反单一职责原则
-
-#### 2. **副作用管理复杂**
-- Attention 本身是纯函数（无副作用）
-- 加入 append 后有副作用（mutate `k_cache`, `v_cache`）
-- 需要在 `torch.library.custom_op` 中声明 `mutates_args=(k_cache_idx, v_cache_idx)`
-- 可能影响 `torch.compile` 的优化
-
-#### 3. **参数组合爆炸**
-```python
-# 需要验证的组合：
-forward(q, k, v)  # 标准 prefill
-forward(q, k, v, k_cache=..., v_cache=...)  # cache + new（只读）
-forward(q, k, v, k_cache=..., v_cache=..., append=True, cache_seqlens=...)  # append + attention
-forward(q, k_cache=..., v_cache=...)  # 纯 cache（k/v 为 None）
-
-# 非法组合需要复杂验证：
-forward(q, k, v, append=True)  # ❌ append=True 但没有 cache？
-forward(q, k_cache=..., append=True)  # ❌ append 但没有 k/v 新数据？
-```
-
-#### 4. **Manifest 声明复杂**
-```yaml
-inputs:
-  k_cache: {dtype: "...", optional: true}
-  v_cache: {dtype: "...", optional: true}
-  cache_seqlens: {dtype: "int32", optional: true}
-params:
-  append: {type: bool, default: false}
-shape_rules:
-  - "(append == True) implies (k_cache is not None)"  # 复杂的逻辑约束
-  - "append implies (cache_seqlens is not None)"
-  - "append implies (k is not None)"
-```
-
-#### 5. **编译边界问题**
-- 一个 Op 有多种行为模式（纯计算 vs 计算+写）
-- `compile_op_names` 是一个还是多个？
-- 有副作用的版本如何声明？
-
-#### 6. **FlashInfer 的选择**
-- FlashInfer（业界最成熟的实现）将 append 和 attention **完全分离**：
-  ```python
-  flashinfer.append_paged_kv_cache(...)  # 只负责写 cache
-  flashinfer.batch_prefill_with_paged_kv_cache(...)  # 只负责计算
-  ```
-- 对于 contiguous cache，FlashInfer **不提供** append API，用户自己管理
-- 这说明 fused append 的收益可能不大，或者实现复杂度不值得
-
-### 7.4 替代方案
-
-#### **方案 A：Utility Function（不是 Op）**
-
-```python
-# tileops/utils/kv_cache.py
-def append_contiguous_kv_cache(
-    k_cache: Tensor,
-    v_cache: Tensor,
-    k_new: Tensor,
-    v_new: Tensor,
-    cache_seqlens: Tensor
-) -> Tensor:
-    """Vectorized contiguous KV cache append (PyTorch operations)."""
-    # 实现高效的 batched append
-    return updated_seqlens
-
-# 用户使用：
-from tileops.utils.kv_cache import append_contiguous_kv_cache
-
-updated_seqlens = append_contiguous_kv_cache(k_cache, v_cache, k_new, v_new, cache_seqlens)
-output = prefill_op(q, k_new, v_new, k_cache=k_cache, v_cache=v_cache)
-```
-
-**优点：**
-- 提供便利的 API
-- 不占用 Op/manifest 资源
-- 职责清晰：utility 负责写，Op 负责计算
-- 灵活：用户可以选择用或不用
-
-#### **方案 B：完全分离（FlashInfer 风格）**
-
-```python
-# 用户自己管理 append（PyTorch 原生操作）
-for i in range(batch):
-    seq_len = cache_seqlens[i]
-    k_cache[i, seq_len:seq_len+new_len] = k_new[i]
-    v_cache[i, seq_len:seq_len+new_len] = v_new[i]
-
-# TileOps 只负责 attention
-output = prefill_op(q, k_new, v_new, k_cache=k_cache, v_cache=v_cache)
-```
-
-**优点：**
-- 最简单，不增加任何复杂度
-- 用户有完全控制权
-- 符合 FlashInfer 的成熟实践
-
-### 7.5 需要讨论的问题
-
-1. **TileOps 的 Op 边界在哪里？**
-   - Op = 纯计算？
-   - Op = 计算 + 状态管理？
-
-2. **后端 Fusion 的实际价值？**
-   - Fused RoPE 有明显收益（避免单独的 RoPE pass）
-   - Fused append 是否有类似收益？
-   - 还是只是 API 便利性，没有性能优势？
-
-3. **实际使用场景？**
-   - Issue #1839 要求的是什么？只是能处理 cache 的 prefill？还是必须 fused append？
-   - LLM serving 场景中，append 和 attention 是否总是一起调用？
-   - 是否有场景只 append 不 attention，或只 attention 不 append？
-
-4. **如果支持，如何在 RFC 中定义规范？**
-   - 副作用如何声明？
-   - Manifest 如何表达复杂约束？
-   - 其他 Ops（Packed、Paged）是否也要支持？
-
-### 7.6 当前建议
-
-**短期（本次 PR）：**
-- ✅ 增加 `k_cache`, `v_cache` 参数（只读）
-- ❌ **不增加** `append` 参数
-- ✅ Issue #1839 可以通过只读 cache 参数 + 外部 append 解决
-
-**中期（团队讨论后）：**
-- 根据讨论结果决定是否支持 append
-- 如果支持，需要先定义 RFC 规范
-- 如果不支持，提供高质量的 utility function
-
-**长期（根据讨论结果）：**
-- 如果决定集成：重构所有 prefill Ops，统一支持 append
-- 如果决定分离：文档中明确最佳实践，参考 FlashInfer 的设计
-
----
-
-## 八、待讨论：Metadata 缓存机制
-
-### 8.1 问题背景
 
 #### 本次 PR 的 callable 与编译缓存边界
 
@@ -942,7 +735,7 @@ Kernel 生命周期问题：枚举、autotune、预热和 CUDA Graph capture 必
 #### 对于 Dense Layout：无需运行期 metadata cache
 
 ```python
-# Dense GQA Prefill
+# Dense GQA
 op = GroupedQueryAttentionPrefillDenseFwdOp(is_causal=True)
 
 # Layer 1
@@ -966,8 +759,8 @@ TileLang 编译缓存足够；暂不引入 cu_seqlens、block table 等运行期
 #### 对于 Varlen/Packed Layout：Kernel 缓存不够
 
 ```python
-# Varlen GQA Prefill
-op = GroupedQueryAttentionPrefillPackedFwdOp(is_causal=True)
+# 假设未来发布 Varlen GQA
+op = GroupedQueryAttentionVarlenFwdOp(is_causal=True)
 
 # Layer 1
 output = op(q, k, v, 
@@ -1008,7 +801,7 @@ Paged layout 的 metadata 更复杂：
 
 每层都要传输、验证、解析这些 metadata，开销更大。
 
-### 8.2 业界方案：FlashInfer 的 Metadata 缓存
+### 7.2 业界方案：FlashInfer 的 Metadata 缓存
 
 FlashInfer 通过 **Wrapper 类**提供显式的 metadata 缓存：
 
@@ -1041,7 +834,7 @@ wrapper.end_forward()
 - 用户需要手动管理 `begin_forward` / `end_forward`
 - 容易忘记调用，导致错误
 
-### 8.3 待讨论议题
+### 7.3 待讨论议题
 
 #### 议题 1：是否支持 Metadata 缓存？
 
@@ -1065,7 +858,7 @@ wrapper.end_forward()
 **方案 A：显式缓存（手动管理）**
 
 ```python
-class GroupedQueryAttentionPrefillPackedFwdOp(Op):
+class GroupedQueryAttentionVarlenFwdOp(Op):
     def prepare_batch(self, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
         """显式准备并缓存 batch metadata"""
         self._cached_metadata = self._preprocess_metadata(
@@ -1085,7 +878,7 @@ class GroupedQueryAttentionPrefillPackedFwdOp(Op):
 
 
 # 用户代码
-op = GroupedQueryAttentionPrefillPackedFwdOp(is_causal=True)
+op = GroupedQueryAttentionVarlenFwdOp(is_causal=True)
 
 op.prepare_batch(cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
 for layer in transformer_layers:
@@ -1108,7 +901,7 @@ op.clear_batch()
 **方案 B：Context Manager（显式缓存 + 自动清理）**
 
 ```python
-class GroupedQueryAttentionPrefillPackedFwdOp(Op):
+class GroupedQueryAttentionVarlenFwdOp(Op):
     @contextmanager
     def batch_scope(self, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
         """Context manager for batch metadata caching"""
@@ -1140,7 +933,7 @@ class GroupedQueryAttentionPrefillPackedFwdOp(Op):
 
 
 # 用户代码 - 模式 1：单次调用（无优化）
-op = GroupedQueryAttentionPrefillPackedFwdOp(is_causal=True)
+op = GroupedQueryAttentionVarlenFwdOp(is_causal=True)
 output = op(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
 
 # 用户代码 - 模式 2：批量优化（多层 transformer）
@@ -1172,7 +965,7 @@ with op.batch_scope(cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
 | **实现复杂度** | 低 | 中等 |
 | **风险** | 用户可能忘记调用 | API 有两种模式，需要文档说明 |
 
-### 8.4 当前建议
+### 7.4 当前建议
 
 **短期（本次 PR #1926）：**
 - ❌ **不实现** metadata 缓存
@@ -1187,5 +980,5 @@ with op.batch_scope(cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
 **长期（如果决定支持）：**
 - **推荐方案 B（Context Manager）**
   - 原因：向后兼容 + 自动清理 + 灵活性
-- 为 Varlen 和 Paged Op 实现 metadata 缓存
+- 优先为 Paged Op 评估 metadata 缓存；Varlen 仅在未来决定发布后纳入
 - Dense Op 不需要（已经足够高效）
