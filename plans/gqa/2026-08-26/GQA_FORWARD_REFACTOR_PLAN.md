@@ -20,13 +20,13 @@ Dense 不通过构造 `cu_seqlens` 复用 Varlen kernel。Paged Op 不分配 pag
 
 ### 1.3 主流算子库与推理框架
 
-| 项目 | 模型或公开接口 | Prefill/decode 与拓扑划分 |
-| --- | --- | --- |
-| [vLLM](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backend.py) | per-layer `Attention(query, key, value, kv_cache, attn_metadata)` | 模型层统一；backend 根据 metadata 选择 prefill/decode，KV cache 按 group 管理 |
-| [SGLang](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/radix_attention.py) | `RadixAttention(q, k, v, forward_batch, ...)` | 模型层统一；backend 内部分为 extend/decode |
-| [TokenSpeed](https://github.com/lightseekorg/tokenspeed) | runtime layer 统一；kernel API 提供 uncached prefill、paged extend、paged decode | 框架隐藏批次管理，底层函数按阶段和存储拓扑拆分 |
-| [FlashInfer](https://docs.flashinfer.ai/api/attention.html) | Ragged/Paged Prefill、Paged Decode wrappers，以及统一 Paged `BatchAttention` | layout 决定 wrapper；`plan/run` 分离 metadata 准备和热路径 |
-| [FlashAttention](https://github.com/Dao-AILab/flash-attention/blob/main/README.md#flashattention-2) | `flash_attn_func(q,k,v,...)` 与 `flash_attn_with_kvcache(...)` | Dense 与 KV-cache 分开；KV-cache 接口内部覆盖 prefill/decode，并以 `block_table` 区分 paged cache |
+| 项目 | 代表接口 | Dense / Varlen / Paged 是否统一 | Prefill / Decode 是否统一 |
+| --- | --- | --- | --- |
+| [vLLM](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backend.py) | per-layer `Attention(query, key, value, kv_cache, attn_metadata)` | **模型层统一，backend 内区分**：模型不直接选择 layout，backend 消费对应 metadata/KV layout | **统一**：同一 Attention 接口根据 metadata 处理 prefill/decode |
+| [SGLang](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/radix_attention.py) | `RadixAttention(q, k, v, forward_batch, ...)` | **模型层统一，backend 内区分**：`ForwardBatch` 携带当前存储与批次 metadata | **模型层统一**：backend 内部分为 `forward_extend` / `forward_decode` |
+| [TokenSpeed](https://github.com/lightseekorg/tokenspeed) | runtime attention layer；`mha_prefill`、`mha_extend_with_kvcache`、`mha_decode_with_kvcache` | **kernel API 不统一**：uncached packed 与 paged cache 是不同函数族 | **kernel API 不统一**：prefill、paged extend、paged decode 分开；runtime backend 负责路由 |
+| [FlashInfer](https://docs.flashinfer.ai/api/attention.html) | Ragged/Paged wrappers；Paged `BatchAttention` | **不统一**：Dense/Ragged/Paged 使用不同函数或 wrapper | **部分统一**：传统 Prefill/Decode wrapper 分开；`BatchAttention` 可统一 Paged mixed prefill/decode |
+| [FlashAttention](https://github.com/Dao-AILab/flash-attention/blob/main/README.md#flashattention-2) | `flash_attn_func`、`flash_attn_varlen_func`、`flash_attn_with_kvcache` | **部分统一**：Dense、Varlen、KV-cache 分开；KV-cache 内以 `block_table` 区分 contiguous/paged | **KV-cache 内统一**：同一入口覆盖 append/prefill/decode；无 cache 的 Dense/Varlen 仍是独立入口 |
 
 共同趋势是：模型层接口可以统一，但底层 Op 的稳定边界首先由 Dense、Paged、Varlen 等存储拓扑决定。TileOps 因此保留 Dense/Paged 两个 release-facing Op，并在各自内部选择 prefill/decode kernel。
 
@@ -154,4 +154,3 @@ GroupedQueryAttentionDenseFwdOp
 4. **Varlen**：暂缓 release；只有出现明确框架接入或训练/离线 workload 后再推进 public manifest。
 
 每个 kernel 迁移 PR 必须证明：公开语义不变、目标 workload 正确、现有性能不回退；kernel 参数或流水差异不得扩张为新的 public Op。
-
