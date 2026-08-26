@@ -89,14 +89,14 @@ o = op(
     v_pages,
     page_table,
     cache_seqlens,
-    qo_indptr,
+    cu_seqlens_q,
     q_scale=None,
     k_scale=None,
     v_scale=None,
 )
 ```
 
-`qo_indptr` 描述每个 request 的 query 范围；普通 decode 是每个 request 一个 query token 的特例。框架负责为当前 layer 传入对应 KV cache，并为当前 cache group 传入对应 page table。
+`cu_seqlens_q` 是 packed Q 的 cumulative sequence lengths，描述每个 request 的 query 范围；普通 decode 是每个 request 一个 query token 的特例。框架负责为当前 layer 传入对应 KV cache，并为当前 cache group 传入对应 page table。
 
 ## 三、Kernel ownership 与 dispatch
 
