@@ -66,7 +66,7 @@ Backend：选择并构造具体 kernel
 
 两种方案都可行，实质上是在决定外部 backend 是 concrete kernel provider，还是更完整的 Op provider。
 
-## 三、更深层的缓存隐患
+## 三、另一个更深层的问题：外部 callable 缓存
 
 当前外部路径缓存的是 external builder 返回的 callable：
 
@@ -108,9 +108,7 @@ cache 还隐含限定在单个 Op 实例、target 和 kernel role 内。相同 s
 
 TileOps key 比 backend dispatch 更细通常安全，只会重复构建；TileOps key 更粗则可能错误复用或固定次优实现。
 
-## 四、两个问题彼此独立
-
-方案 A 解决参数语义所有权，但不会自动解决 cache key。#1976 不把 resolved params 放入 external key，因此要求它们是 Op 实例配置与输入 signature 的确定性函数。
+这个缓存问题独立于前述参数方案。方案 A 解决参数语义所有权，但不会自动解决 cache key。#1976 不把 resolved params 放入 external key，因此要求它们是 Op 实例配置与输入 signature 的确定性函数。
 
 方案 B 同样不会自动解决缓存问题。即使 backend 自己解析 raw params，只要其 dispatch 使用了 TileOps key 未覆盖、并且会在相同 signature 下变化的 item，TileOps 仍可能提前命中旧 callable。
 
@@ -121,7 +119,7 @@ TileOps key 比 backend dispatch 更细通常安全，只会重复构建；TileO
 | 参数语义契约 | Op 传 resolved params，还是 backend 处理 raw params |
 | specialization cache 契约 | TileOps 固定 key、backend 参与 key，还是缓存 backend runtime dispatcher |
 
-## 五、缓存问题的可选解法
+## 四、缓存问题的可选解法
 
 ### 方向 1：固定 TileOps external signature
 
@@ -162,7 +160,7 @@ def external_callable(*real_inputs):
 
 如果希望保留单层 cache，同时允许第三方 backend 自主定义 specialization，方向 2 更平衡；如果 dispatch 必须依赖 tensor 内容，则只能选择 runtime dispatcher，或者重新设计更高层的动态执行边界。
 
-## 六、结论
+## 五、结论
 
 #1976 只处理参数语义契约，没有自动处理第三方 backend 的 specialization cache 契约。
 
