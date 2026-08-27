@@ -4,7 +4,7 @@ GQA Op 的设计主要考虑三个方面：
 
 1. **功能覆盖**：Op 应覆盖主要推理场景，支持不同的 KV 内存形式以及 RoPE、sliding window 等辅助功能。
 2. **框架适配**：Op 的功能分类、声明方式和 forward 签名应尽可能与主流推理框架无缝对接。
-3. **内部契约**：算子变体在实例化 Op 时明确；tensor shape 和动态 metadata 在 forward 时解析，并据此 dispatch kernel。
+3. **契约统一**：Dense、Varlen、Paged GQA 应采用一致的参数生命周期，并遵循 TileOps 的统一契约——算子变体在实例化 Op 时明确，tensor shape 和动态 metadata 在 forward 时解析，并据此 dispatch kernel。
 
 下面依次说明功能需求、框架接口调研及最终设计。
 
@@ -41,7 +41,7 @@ general、persistent、WS、split-K 等只是内部 kernel specialization，不�
 
 调研结论：模型层可以统一 attention，但底层实现仍然围绕 KV 存储拓扑组织；同一拓扑下的 prefill/decode 可以共享 public ABI。框架私有对象（如 `attn_metadata`、`ForwardBatch`）不应进入 TileOps ABI。
 
-### 1.3 设计结论与内部契约
+### 1.3 设计结论与统一契约
 
 据此设计三个 Op：
 
@@ -51,7 +51,7 @@ general、persistent、WS、split-K 等只是内部 kernel specialization，不�
 | `GroupedQueryAttentionVarlenFwdOp` | Varlen KV；统一 varlen prefill/decode | 暂缓发布 |
 | `GroupedQueryAttentionPagedFwdOp` | Paged KV；统一 paged prefill/extend/decode | 首批发布 |
 
-mask、window、softcap 和 RoPE 语义在实例化 Op 时确定；实际 tensor 与动态 metadata 在 forward 时传入：
+三个 GQA Op 使用相同的职责划分，并与 TileOps 的 forward 契约保持一致：mask、window、softcap 和 RoPE 语义在实例化 Op 时确定；实际 tensor 在 forward 时传入，shape 和动态 metadata 也在 forward 时解析。
 
 | 阶段 | 内容 |
 | --- | --- |
