@@ -121,8 +121,49 @@ TileOps key 比 backend dispatch 更细通常安全，只会重复构建；TileO
 | 参数语义契约 | Op 传 resolved params，还是 backend 处理 raw params |
 | specialization cache 契约 | TileOps 固定 key、backend 参与 key，还是缓存 backend runtime dispatcher |
 
-## 五、结论
+## 五、缓存问题的可选解法
+
+### 方向 1：固定 TileOps external signature
+
+维持当前 key，并把它写成第三方 backend 必须遵守的契约：
+
+> Builder 只能根据当前 signature 和 cache 作用域内不变的配置选择 kernel；返回的 callable 必须服务该 signature 表示的整个等价类。
+
+该方案最简单，能够维持单层 Op cache，但限制了第三方 backend 使用额外 dispatch facts。
+
+### 方向 2：允许 backend 提供 specialization-key hook
+
+backend 在注册 builder 时同时声明自己的 key：
+
+```python
+register_kernel_builder(
+    op="GroupedQueryAttentionDenseFwdOp",
+    target="external",
+    specialization_key=external_gqa_key,
+    build_kernel=build_external_gqa,
+)
+```
+
+TileOps 将基础 signature 与 backend key 组合后缓存 concrete callable。这样仍然只有一层 Op cache，但第三方 backend 可以表达自己的 specialization 边界。
+
+key hook 必须便宜、可哈希、确定，并且不能依赖读取 tensor 内容或触发设备同步的动态值。
+
+### 方向 3：缓存 backend runtime dispatcher
+
+TileOps 缓存一个通用 callable，由 backend 在每次执行时继续 dispatch：
+
+```python
+def external_callable(*real_inputs):
+    kernel = backend_runtime_dispatch(real_inputs)
+    return kernel(*real_inputs)
+```
+
+该方案给第三方 backend 最大自主性，也能处理 tensor-value-dependent dispatch；代价是可能增加热路径开销、引入第二层 cache，并削弱 TileOps 对 concrete kernel 的统一枚举和 autotune 管理。
+
+如果希望保留单层 cache，同时允许第三方 backend 自主定义 specialization，方向 2 更平衡；如果 dispatch 必须依赖 tensor 内容，则只能选择 runtime dispatcher，或者重新设计更高层的动态执行边界。
+
+## 六、结论
 
 #1976 只处理参数语义契约，没有自动处理第三方 backend 的 specialization cache 契约。
 
-无论选择方案 A 还是 B，只要 TileOps 缓存 external backend 返回的 concrete callable，就必须明确该 cache key 表示的等价类。若希望第三方 backend 拥有更自由的 dispatch，后续还需要在以下方向中选择：限制 backend 只能使用现有 signature、允许 backend 提供 specialization-key hook，或者缓存 backend 自己的 runtime dispatcher。
+无论选择方案 A 还是 B，只要 TileOps 缓存 external backend 返回的 concrete callable，就必须同时明确参数含义和 cache 等价类。第三方 backend 的自主范围越大，就越需要让它参与 specialization key，或者把后续 dispatch 留在缓存的 callable 内。
