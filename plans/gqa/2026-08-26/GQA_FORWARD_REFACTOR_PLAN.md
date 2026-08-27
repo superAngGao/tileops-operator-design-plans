@@ -1,24 +1,33 @@
 # GQA 前向算子设计
 
-目标：用少量稳定的 public Op 覆盖主要推理场景，并允许内部按输入特征选择不同 kernel。
+GQA Op 的边界不应由现有 kernel 反推，而应依次回答三个问题：
 
-## 1. 设计原则
+1. **功能覆盖**：主要推理场景需要哪些 KV 形式和辅助能力？
+2. **框架适配**：主流推理框架如何划分 attention 接口，哪些参数会在每次调用时变化？
+3. **内部契约**：哪些语义在 Op 实例化时固定，哪些信息在 forward 时解析，如何据此 dispatch kernel？
+
+下面按照这条逻辑得到 public Op 和内部 dispatch 设计。
+
+## 1. 从需求到设计
 
 ### 1.1 功能覆盖
 
-Public Op 按 KV 存储拓扑划分，不按 mask、dtype 或 kernel 实现划分。
+KV 存储形式是最主要的功能边界：
 
-| 拓扑 | Public Op | 输入 | 场景 |
-| --- | --- | --- | --- |
-| Dense | `GroupedQueryAttentionDenseFwdOp` | BSHD Q/K/V | 连续 KV；统一 prefill/decode |
-| Paged | `GroupedQueryAttentionPagedFwdOp` | packed Q、K/V pages、page table、长度信息 | continuous batching、prefix cache、chunked prefill；统一 prefill/extend/decode |
-| Varlen | `GroupedQueryAttentionVarlenFwdOp`（暂缓发布） | packed Q/K/V、`cu_seqlens_q/kv` | 训练或无 paged cache 的 ragged batch |
+| KV 形式 | 输入 | 主要场景 |
+| --- | --- | --- |
+| Dense | BSHD Q/K/V | 连续 KV、低延迟推理 |
+| Varlen | packed Q/K/V、`cu_seqlens_q/kv` | 训练或无 paged cache 的 ragged batch |
+| Paged | packed Q、K/V pages、page table、长度信息 | continuous batching、prefix cache、chunked prefill |
 
-以下能力属于 Op 配置或 kernel specialization，不产生新 Op：
+三种 KV 形式都应尽可能覆盖相同的用户可见变体：
 
-`causal/non-causal` · full/sliding-window · custom `sm_scale` · softcap · FP16/BF16/native FP8 · NeoX/interleaved RoPE · general/persistent/WS/split-K
+- mask：causal/non-causal、full/sliding-window；
+- attention 语义：custom `sm_scale`、softcap；
+- 数据格式：FP16、BF16、native FP8；
+- 位置编码：no-RoPE、NeoX RoPE、interleaved RoPE。
 
-Paged Op 只读 KV cache；page 分配、KV append 和 cache mutation 由推理 runtime 完成。
+general、persistent、WS、split-K 等只是内部 kernel specialization，不属于 public 功能分类。
 
 ### 1.2 框架适配
 
@@ -30,9 +39,19 @@ Paged Op 只读 KV cache；page 分配、KV append 和 cache mutation 由推理 
 | [FlashInfer](https://docs.flashinfer.ai/api/attention.html) | Dense/Ragged/Paged 分开 | Paged 新接口可统一 | Ragged/Paged wrappers、Paged `BatchAttention` |
 | [FlashAttention](https://github.com/Dao-AILab/flash-attention) | Dense/Varlen/KV-cache 分开 | KV-cache 接口统一 | `flash_attn_func`、`flash_attn_varlen_func`、`flash_attn_with_kvcache` |
 
-结论：TileOps 底层按存储拓扑拆 Op，每个 Op 内统一 prefill/decode。框架私有对象（如 `attn_metadata`、`ForwardBatch`）不进入 TileOps ABI。
+调研结论：模型层可以统一 attention，但底层实现仍然围绕 KV 存储拓扑组织；同一拓扑下的 prefill/decode 可以共享 public ABI。框架私有对象（如 `attn_metadata`、`ForwardBatch`）不应进入 TileOps ABI。
 
-### 1.3 内部契约
+### 1.3 设计结论与内部契约
+
+据此设计三个 Op：
+
+| Public Op | 边界 | 发布计划 |
+| --- | --- | --- |
+| `GroupedQueryAttentionDenseFwdOp` | Dense KV；统一 dense prefill/decode | 首批发布 |
+| `GroupedQueryAttentionVarlenFwdOp` | Varlen KV；统一 varlen prefill/decode | 暂缓发布 |
+| `GroupedQueryAttentionPagedFwdOp` | Paged KV；统一 paged prefill/extend/decode | 首批发布 |
+
+mask、window、softcap 和 RoPE 语义在实例化 Op 时确定；实际 tensor 与动态 metadata 在 forward 时传入：
 
 | 阶段 | 内容 |
 | --- | --- |
@@ -40,7 +59,9 @@ Paged Op 只读 KV cache；page 分配、KV append 和 cache mutation 由推理 
 | forward 输入 | Q/K/V 或 KV pages、page table、sequence metadata、FP8 scales、RoPE tables |
 | forward 推导 | B、Sq、Skv、H、Hkv、D、输入 dtype、prefill/decode 区域、kernel selection facts |
 
-构造期语义固定在 Op 实例中；shape 和动态 metadata 每次从输入解析，不写回 Op。page table 由 runtime 持有。
+forward 根据本次 Q/K/V 的 shape、dtype 和 metadata 选择 concrete kernel，并通过单层 `get_or_build_kernel` cache 复用。动态信息不写回 Op。
+
+Paged Op 只读 KV cache；page table 由 runtime 持有，page 分配、KV append 和 cache mutation 也由 runtime 完成。
 
 ## 2. Public ABI
 
