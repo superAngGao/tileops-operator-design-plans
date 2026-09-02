@@ -34,7 +34,7 @@ Q/K/V 采用 BSHD：`q=[B,Sq,H,D]`，`k/v=[B,Skv,Hkv,D]`。同一接口覆盖：
 - custom scale、softcap、RoPE；
 - FP16、BF16 和 native FP8。
 
-重构前，与 Dense 拓扑相关的 public Op 和 dispatch 如下：
+重构前，被 Dense Op 全部或部分覆盖的 public Op 和 dispatch 如下：
 
 | 旧 Op | 语义/布局 | 原 dispatch kernel | 归属 |
 | --- | --- | --- | --- |
@@ -44,6 +44,11 @@ Q/K/V 采用 BSHD：`q=[B,Sq,H,D]`，`k/v=[B,Skv,Hkv,D]`。同一接口覆盖：
 | `GroupedQueryAttentionDecodeWithKVCacheFwdOp` | 连续 KV 的 GQA decode | `GQADecodeBs1Kernel`、`GQADecodeKernel` | 被 Dense Op 吸收 |
 | `MultiHeadAttentionDecodeWithKVCacheFwdOp` | 连续 KV 的 MHA decode | `MHADecodeKernel` | 作为 `Hkv == H` 被 Dense Op 吸收 |
 | `GroupedQueryAttentionPrefillFwdOp` | THD packed umbrella | dense、varlen、window、FP8 六类 kernel | 只把 uniform-dense/FP8-dense 分支迁入 Dense；其余归 Varlen |
+
+以下 public Op 使用不同的数据拓扑或计算方向，不受 Dense Op 重构影响：
+
+| Op | 语义/布局 | Dispatch kernel | 后续归属 |
+| --- | --- | --- | --- |
 | `GroupedQueryAttentionPrefillVarlenFwdOp` | THD ragged | `GQAPrefillVarlenFwdKernel` | 归未来 Varlen Op，不归 Dense |
 | `GroupedQueryAttentionSlidingWindowVarlenFwdOp` | THD ragged window | `GQASlidingWindowVarlenFwdWgmmaPipelinedKernel` | 归未来 Varlen Op，不归 Dense |
 | Paged prefill/decode Ops | Paged KV | Paged kernel families | 归未来 Paged Op，不归 Dense |
